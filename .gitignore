@@ -5,3 +5,4 @@ export_env.sh
 **/.cache/
 **/guacamole/.env
 **/config/*.env.local
+\n.env\n
