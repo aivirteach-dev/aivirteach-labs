@@ -9,7 +9,7 @@ import httpx
 from aivirteach_agent.app import build_provider, create_app
 from aivirteach_agent.config import Settings
 from aivirteach_agent.models import DiagnoseRequest, ToolName
-from aivirteach_agent.orchestrator import AgentOrchestrator, _parse_draft
+from aivirteach_agent.orchestrator import AgentOrchestrator, _parse_assessment
 from aivirteach_agent.prompts import SYSTEM_PROMPT
 from aivirteach_agent.providers import (
     FakeProvider,
@@ -195,13 +195,15 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
         events = _parse_sse(response.text)
         event_names = [event for event, _ in events]
         self.assertEqual(
-            event_names[:6],
+            event_names[:8],
             [
                 "accepted",
                 "started",
                 "context_ready",
                 "reasoning_started",
                 "reasoning_finished",
+                "assessment_validating",
+                "assessment_validated",
                 "answer_started",
             ],
         )
@@ -234,7 +236,6 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
 class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorized_tool_call_collects_real_evidence(self) -> None:
         final = {
-            "answer": "Docker 服务未运行。",
             "diagnosis": {
                 "summary": "docker.service is inactive",
                 "probable_causes": ["Docker 未启动"],
@@ -307,7 +308,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 ProviderTurn(
                     text=json.dumps(
                         {
-                            "answer": "没有足够证据。",
                             "diagnosis": {"summary": "未知", "confidence": "low"},
                             "course_alignment": {"expected": [], "observed": []},
                             "evidence_ids": [],
@@ -329,7 +329,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_tool_call_uses_request_cache(self) -> None:
         final = {
-            "answer": "已收集证据。",
             "diagnosis": {"summary": "状态已知", "confidence": "medium"},
             "course_alignment": {"expected": [], "observed": []},
             "evidence_ids": ["obs-001"],
@@ -532,12 +531,11 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ModelOutputParsingTests(unittest.TestCase):
-    def test_extracts_valid_answer_after_provider_preamble(self) -> None:
-        draft = _parse_draft(
+    def test_extracts_valid_assessment_after_provider_preamble(self) -> None:
+        draft = _parse_assessment(
             "I have enough evidence.\n\n"
             + json.dumps(
                 {
-                    "answer": "虚拟机运行正常。",
                     "diagnosis": {
                         "summary": "状态正常",
                         "probable_causes": [],
@@ -552,7 +550,7 @@ class ModelOutputParsingTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(draft.answer, "虚拟机运行正常。")
+        self.assertEqual(draft.diagnosis.summary, "状态正常")
         self.assertEqual(draft.limitations, ["未检查应用端口。"])
 
 

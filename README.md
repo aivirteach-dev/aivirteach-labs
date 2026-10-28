@@ -174,17 +174,24 @@ POST   /v1/agent/diagnose                     # 实际运行于 8770
 POST   /v1/agent/diagnose/stream              # 8770 SSE 进度、回答增量与最终结果
 ```
 
-Agent 的 SSE 接口使用与普通诊断接口完全相同的 JSON request body 和
-`AIVIRTEACH_AGENT_TOKEN`。它依次发送 `accepted`、`started`、
-`context_ready`、推理状态、经过清理的工具状态、`answer_started`、一个或多个
-`assistant_delta`、`answer_finished`、`result` 和 `done`。客户端应按顺序追加
-每个 `assistant_delta.data.delta`，即可获得类似聊天应用的逐步回答效果；模型供应商
-可能在一个 delta 中返回一个或多个 token，因此不要假设一次事件严格等于一个 token。
-`result.response` 与普通接口的 `DiagnoseResponse` 相同，并且是最终权威结果；如果
-中途出现 `answer_failed`，客户端应以随后 `result.response.answer` 替换已显示的部分
-文本。该接口不会发送模型内部推理、工具参数或原始日志。因为它是带 Bearer Token
-和 JSON body 的 POST，浏览器应使用 `fetch` 的 ReadableStream，而不是只能发 GET
-的 `EventSource`。
+Agent 的普通 JSON 和 SSE 接口使用同一条诊断与回答流程。第一阶段输出
+`DiagnosticAssessment`，包含诊断结论、推测、证据引用、建议与限制，不包含完整
+`answer`。结构和证据引用通过校验后，模型只生成一次学员正文。校验不证明模型推测
+为事实。若校验失败，返回通用重试提示，不把原始模型 JSON 作为答案；若正文生成
+失败，使用已校验诊断的确定性摘要兜底，不再调用模型重写。
+
+SSE 使用与普通诊断接口相同的 JSON request body 和 `AIVIRTEACH_AGENT_TOKEN`。
+正常流程依次发送 `accepted`、`started`、`context_ready`、推理与工具状态、
+`assessment_validating`、`assessment_validated`、`answer_started`、
+`assistant_delta`、`answer_finished`、`result` 和 `done`。每个 delta 可包含多个
+字符或 token。诊断无效时不会产生正文增量，而是发送 `answer_failed` 和最终
+`result`。正文中断时客户端应清除草稿，并以 `result.response.answer` 替换。
+
+`result.response` 保持原有 `DiagnoseResponse` 契约；普通接口等待同一结果后返回
+JSON。两种接口的用量均包含诊断调用和最终正文调用。Labs 的 `answer_finished`
+只表示生成结束，不表示 Server 已保存消息。接口不发送模型内部推理、工具参数或
+原始日志。浏览器 POST 应使用 `fetch` 的 ReadableStream，而不是只发 GET 的
+`EventSource`。
 
 终端测试时，把普通 Agent request body 保存为 `request.json`：
 

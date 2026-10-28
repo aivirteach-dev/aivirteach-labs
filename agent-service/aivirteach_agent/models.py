@@ -159,9 +159,8 @@ class SuggestedAction(StrictModel):
     detail: str = Field(min_length=1, max_length=2_000)
 
 
-class AnswerDraft(StrictModel):
-    answer: str = Field(min_length=1, max_length=12_000)
-    diagnosis: Diagnosis = Field(default_factory=Diagnosis)
+class DiagnosticAssessment(StrictModel):
+    diagnosis: Diagnosis
     course_alignment: CourseAlignment = Field(default_factory=CourseAlignment)
     evidence_ids: list[str] = Field(default_factory=list, max_length=12)
     suggested_actions: list[SuggestedAction] = Field(default_factory=list, max_length=8)
@@ -189,6 +188,15 @@ class Usage(StrictModel):
     input_cache_hit_tokens: int = Field(ge=0)
     input_cache_miss_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
+
+
+class AssessmentOutcome(StrictModel):
+    assessment: DiagnosticAssessment | None
+    evidence: list[Evidence]
+    tool_trace: list[ToolTrace]
+    limitations: list[str]
+    partial: bool
+    usage: Usage | None
 
 
 class DiagnoseResponse(StrictModel):

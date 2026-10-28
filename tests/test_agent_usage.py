@@ -35,7 +35,7 @@ DEEPSEEK_EXPECTED = Usage(
     input_cache_hit_tokens=640, input_cache_miss_tokens=360, output_tokens=200
 )
 
-FINAL_ANSWER = json.dumps({"answer": "Docker 服务未运行。"}, ensure_ascii=False)
+FINAL_ASSESSMENT = json.dumps({"diagnosis": {"summary": "Docker 服务未运行。"}}, ensure_ascii=False)
 
 
 def usage(hit: int, miss: int, out: int) -> Usage:
@@ -319,7 +319,7 @@ class OrchestratorUsageTests(unittest.IsolatedAsyncioTestCase):
                 [
                     _tool_turn("c1", usage(10, 20, 5)),
                     _tool_turn("c2", usage(30, 40, 6)),
-                    ProviderTurn(text=FINAL_ANSWER, usage=usage(1, 2, 3)),
+                    ProviderTurn(text=FINAL_ASSESSMENT, usage=usage(1, 2, 3)),
                 ]
             )
         )
@@ -327,14 +327,14 @@ class OrchestratorUsageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_usage_is_none_when_no_call_reports_usage(self) -> None:
         response = await self._diagnose(
-            FakeProvider([_tool_turn("c1", None), ProviderTurn(text=FINAL_ANSWER)])
+            FakeProvider([_tool_turn("c1", None), ProviderTurn(text=FINAL_ASSESSMENT)])
         )
         self.assertIsNone(response.usage)
         self.assertIsNone(response.model_dump(mode="json")["usage"])
 
     async def test_partial_usage_sums_reporting_calls_and_warns(self) -> None:
         provider = FakeProvider(
-            [_tool_turn("c1", usage(10, 20, 5)), ProviderTurn(text=FINAL_ANSWER)]
+            [_tool_turn("c1", usage(10, 20, 5)), ProviderTurn(text=FINAL_ASSESSMENT)]
         )
         with self.assertLogs("aivirteach.agent", level="WARNING"):
             response = await self._diagnose(provider)
@@ -346,7 +346,7 @@ class OrchestratorUsageTests(unittest.IsolatedAsyncioTestCase):
             provider=FakeProvider(
                 [
                     _tool_turn("c1", usage(10, 20, 5)),
-                    ProviderTurn(text=FINAL_ANSWER, usage=usage(1, 1, 1)),
+                    ProviderTurn(text=FINAL_ASSESSMENT, usage=usage(1, 1, 1)),
                 ]
             ),
             gateway=FakeGateway(),
@@ -358,7 +358,7 @@ class OrchestratorUsageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_usage_is_added_to_diagnosis_usage(self) -> None:
         provider = StreamingFakeProvider(
-            [_tool_turn("c1", usage(10, 20, 5)), ProviderTurn(text=FINAL_ANSWER, usage=usage(1, 2, 3))],
+            [_tool_turn("c1", usage(10, 20, 5)), ProviderTurn(text=FINAL_ASSESSMENT, usage=usage(1, 2, 3))],
             stream_usage=usage(100, 0, 7),
         )
 
@@ -373,7 +373,7 @@ class OrchestratorUsageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_only_usage_when_diagnosis_calls_report_none(self) -> None:
         provider = StreamingFakeProvider(
-            [ProviderTurn(text=FINAL_ANSWER)], stream_usage=usage(0, 9, 4)
+            [ProviderTurn(text=FINAL_ASSESSMENT)], stream_usage=usage(0, 9, 4)
         )
 
         async def ignore(event: str, data: dict[str, Any]) -> None:
@@ -387,7 +387,7 @@ class OrchestratorUsageTests(unittest.IsolatedAsyncioTestCase):
 
     async def _stream_with(self, stream_events: list[Any]) -> DiagnoseResponse:
         provider = ScriptedStreamProvider(
-            [_tool_turn("c1", usage(10, 20, 5)), ProviderTurn(text=FINAL_ANSWER, usage=usage(1, 2, 3))],
+            [_tool_turn("c1", usage(10, 20, 5)), ProviderTurn(text=FINAL_ASSESSMENT, usage=usage(1, 2, 3))],
             stream_events,
         )
 
@@ -426,7 +426,7 @@ class ApiUsageTests(unittest.IsolatedAsyncioTestCase):
         from aivirteach_agent.app import create_app
 
         provider = StreamingFakeProvider(
-            [ProviderTurn(text=FINAL_ANSWER, usage=usage(10, 20, 5))],
+            [ProviderTurn(text=FINAL_ASSESSMENT, usage=usage(10, 20, 5))],
             stream_usage=usage(1, 2, 3),
         )
         app = create_app(
@@ -443,13 +443,13 @@ class ApiUsageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 plain.json()["usage"],
                 {
-                    "input_cache_hit_tokens": 10,
-                    "input_cache_miss_tokens": 20,
-                    "output_tokens": 5,
+                    "input_cache_hit_tokens": 11,
+                    "input_cache_miss_tokens": 22,
+                    "output_tokens": 8,
                 },
             )
 
-            provider._turns.append(ProviderTurn(text=FINAL_ANSWER, usage=usage(10, 20, 5)))
+            provider._turns.append(ProviderTurn(text=FINAL_ASSESSMENT, usage=usage(10, 20, 5)))
             streamed = await client.post(
                 "/v1/agent/diagnose/stream", json=request_payload(), headers=headers
             )

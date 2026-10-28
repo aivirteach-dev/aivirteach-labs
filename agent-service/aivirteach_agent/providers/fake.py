@@ -35,7 +35,6 @@ class FakeProvider:
         if self._turns:
             return self._turns.popleft()
         draft = {
-            "answer": _FAKE_ANSWER,
             "diagnosis": {
                 "summary": "未配置真实模型供应商。",
                 "probable_causes": [],
@@ -58,14 +57,12 @@ class FakeProvider:
         answer = self._render_answer(messages)
         # Fixed-size chunks make local streaming deterministic while still
         # exercising incremental rendering instead of one buffered response.
-        for offset in range(0, len(answer), 12):
-            yield ProviderTextDelta(text=answer[offset : offset + 12])
+        for offset in range(0, len(answer), 6):
+            yield ProviderTextDelta(text=answer[offset : offset + 6])
         yield ProviderStreamDone(finish_reason="stop")
 
     @staticmethod
     def _render_answer(messages: Sequence[ProviderMessage]) -> str:
-        """Extract the validated answer from the final renderer's JSON input."""
-
         for message in reversed(messages):
             if message.role != "user" or not message.content:
                 continue
@@ -75,10 +72,10 @@ class FakeProvider:
                 continue
             if not isinstance(context, dict):
                 continue
-            draft = context.get("validated_draft")
+            draft = context.get("validated_assessment")
             if not isinstance(draft, dict):
                 continue
-            answer = draft.get("answer")
+            answer = draft.get("diagnosis", {}).get("summary")
             if isinstance(answer, str) and answer:
                 return answer
         return _FAKE_ANSWER

@@ -13,7 +13,8 @@ from .config import Settings
 from .course_repository import CourseRepository
 from .gateway import DiagnosticGateway, GatewayError
 from .models import (
-    AnswerDraft,
+    AssessmentOutcome,
+    DiagnosticAssessment,
     Confidence,
     CourseAlignment,
     DiagnoseRequest,
@@ -61,12 +62,12 @@ class AgentOrchestrator:
         self._gateway = gateway
         self._course_repository = course_repository
 
-    async def diagnose(
+    async def _assess(
         self,
         request: DiagnoseRequest,
         *,
         on_event: ProgressCallback | None = None,
-    ) -> DiagnoseResponse:
+    ) -> AssessmentOutcome:
         if self._course_repository is not None:
             request = self._course_repository.enrich(request)
         await _emit(
@@ -349,8 +350,8 @@ class AgentOrchestrator:
             limitations.append("MODEL_PROVIDER_ERROR")
             final_turn = ProviderTurn(text=f"模型供应商暂时无法完成诊断：{type(exc).__name__}")
 
-        return self._response(
-            request=request,
+        await _emit(on_event, "assessment_validating", {})
+        return self._assessment(
             final_turn=final_turn,
             evidence=evidence,
             traces=traces,
@@ -359,14 +360,26 @@ class AgentOrchestrator:
             usage=_sum_usage(usages),
         )
 
+    async def diagnose(
+        self,
+        request: DiagnoseRequest,
+        *,
+        on_event: ProgressCallback | None = None,
+    ) -> DiagnoseResponse:
+        return await self.diagnose_stream(request, on_event=on_event)
+
     async def diagnose_stream(
         self,
         request: DiagnoseRequest,
         *,
-        on_event: ProgressCallback,
+        on_event: ProgressCallback | None = None,
     ) -> DiagnoseResponse:
-        """Diagnose first, then stream a safe learner-facing final answer."""
-        response = await self.diagnose(request, on_event=on_event)
+        outcome = await self._assess(request, on_event=on_event)
+        response = _assessment_response(request, outcome)
+        if outcome.assessment is None:
+            await _emit(on_event, "answer_failed", {"code": "ASSESSMENT_INVALID"})
+            return response
+        await _emit(on_event, "assessment_validated", {"status": response.status})
         await _emit(on_event, "answer_started", {"phase": "final_answer"})
 
         answer_parts: list[str] = []
@@ -377,7 +390,7 @@ class AgentOrchestrator:
         try:
             async with asyncio.timeout(self._settings.model_timeout_seconds):
                 async for event in self._provider.stream_complete(
-                    messages=answer_render_messages(request, response),
+                    messages=answer_render_messages(request, outcome),
                     tools=(),
                 ):
                     if isinstance(event, ProviderStreamDone):
@@ -451,51 +464,59 @@ class AgentOrchestrator:
             raise ProviderError("model provider timed out") from exc
 
     @staticmethod
-    def _response(
+    def _assessment(
         *,
-        request: DiagnoseRequest,
         final_turn: ProviderTurn | None,
         evidence: list[Evidence],
         traces: list[ToolTrace],
         limitations: list[str],
         partial: bool,
         usage: Usage | None,
-    ) -> DiagnoseResponse:
-        text = (final_turn.text if final_turn else None) or "诊断未能在限定时间内生成完整回答。"
-        structured = True
+    ) -> AssessmentOutcome:
+        assessment = None
         try:
-            draft = _parse_draft(text)
-        except (ValueError, ValidationError, json.JSONDecodeError):
-            structured = False
+            assessment = _parse_assessment((final_turn.text if final_turn else None) or "")
+        except (ValueError, ValidationError):
             partial = True
             limitations.append("MODEL_OUTPUT_UNSTRUCTURED")
-            draft = AnswerDraft(
-                answer=_fallback_answer(text, request.response_language),
-                diagnosis=Diagnosis(summary="模型未返回可验证的结构化诊断。", confidence=Confidence.LOW),
-                course_alignment=CourseAlignment(),
-            )
-
         actual = {item.id: item for item in evidence}
-        unknown_ids = [item for item in draft.evidence_ids if item not in actual]
-        if unknown_ids:
-            partial = True
-            limitations.append("MODEL_REFERENCED_UNKNOWN_EVIDENCE")
-        selected_ids = [item for item in draft.evidence_ids if item in actual]
-        selected = [actual[item] for item in selected_ids] if selected_ids else evidence
-        all_limitations = list(dict.fromkeys([*draft.limitations, *limitations]))
-
-        return DiagnoseResponse(
-            request_id=request.request_id,
-            status="partial" if partial or not structured else "completed",
-            answer=draft.answer,
-            diagnosis=draft.diagnosis,
-            course_alignment=draft.course_alignment,
-            evidence=selected,
-            suggested_actions=draft.suggested_actions,
-            limitations=all_limitations,
-            tool_trace=traces,
+        if assessment is not None:
+            limitations = list(dict.fromkeys([*assessment.limitations, *limitations]))
+            if any(item not in actual for item in assessment.evidence_ids):
+                partial = True
+                limitations.append("MODEL_REFERENCED_UNKNOWN_EVIDENCE")
+                assessment = None
+        selected = [actual[item] for item in assessment.evidence_ids] if assessment and assessment.evidence_ids else evidence
+        return AssessmentOutcome(
+            assessment=assessment, evidence=selected, tool_trace=traces,
+            limitations=list(dict.fromkeys(limitations)), partial=partial,
             usage=usage,
         )
+
+
+def _assessment_response(request: DiagnoseRequest, outcome: AssessmentOutcome) -> DiagnoseResponse:
+    assessment = outcome.assessment
+    return DiagnoseResponse(
+        request_id=request.request_id,
+        status="partial" if outcome.partial or assessment is None else "completed",
+        answer=_assessment_fallback(assessment, request.response_language),
+        diagnosis=assessment.diagnosis if assessment else Diagnosis(confidence=Confidence.LOW),
+        course_alignment=assessment.course_alignment if assessment else CourseAlignment(),
+        evidence=outcome.evidence,
+        suggested_actions=assessment.suggested_actions if assessment else [],
+        limitations=outcome.limitations, tool_trace=outcome.tool_trace, usage=outcome.usage,
+    )
+
+
+def _assessment_fallback(assessment: DiagnosticAssessment | None, language: str) -> str:
+    chinese = language.lower().startswith("zh")
+    if assessment is None:
+        return "暂时无法生成完整回答，请稍后重试。" if chinese else "I couldn't generate a complete answer. Please try again."
+    title = "详细回复暂时不可用，以下是本次诊断摘要（结论仍可能存在不确定性）：" if chinese else "The detailed reply is unavailable. Diagnostic summary (conclusions may be uncertain):"
+    parts = [title, assessment.diagnosis.summary]
+    parts.extend(f"- {action.title}: {action.detail}" for action in assessment.suggested_actions)
+    parts.extend(f"- {limitation}" for limitation in assessment.limitations)
+    return "\n\n".join(part for part in parts if part.strip())[:MAX_STREAM_ANSWER_CHARS]
 
 
 def _sum_usage(usages: list[Usage | None]) -> Usage | None:
@@ -528,7 +549,7 @@ def _parse_output_object(text: str) -> dict[str, Any]:
     in_string = False
     escaped = False
     start = 0
-    answer_object: dict[str, Any] | None = None
+    assessment_object: dict[str, Any] | None = None
     closing = {"}": "{", "]": "["}
 
     for offset, character in enumerate(cleaned):
@@ -554,47 +575,31 @@ def _parse_output_object(text: str) -> dict[str, Any]:
                 raise ValueError("Mismatched model output container")
             if stack:
                 continue
-            # Decode complete outer containers only. A nested answer is never
-            # a substitute for a broken or unrelated enclosing object.
             try:
                 payload = json.loads(cleaned[start : offset + 1])
             except json.JSONDecodeError:
                 continue
-            if isinstance(payload, dict) and "answer" in payload:
-                if answer_object is not None:
-                    raise ValueError("Multiple model answer objects")
-                answer_object = payload
+            if isinstance(payload, dict) and "diagnosis" in payload:
+                if assessment_object is not None:
+                    raise ValueError("Multiple model assessment objects")
+                assessment_object = payload
 
     if stack:
         raise ValueError("Incomplete model output container")
-    if answer_object is None:
-        raise ValueError("No model answer object found")
-    return answer_object
+    if assessment_object is None:
+        raise ValueError("No model assessment object found")
+    return assessment_object
 
 
-def _parse_draft(text: str) -> AnswerDraft:
+def _parse_assessment(text: str) -> DiagnosticAssessment:
     payload = _parse_output_object(text)
     if isinstance(payload.get("limitations"), str):
         limitation = payload["limitations"].strip()
         payload["limitations"] = [limitation] if limitation else []
-    draft = AnswerDraft.model_validate(payload)
-    if not draft.answer.strip():
-        raise ValueError("Model answer must not be blank")
-    return draft
-
-
-def _fallback_answer(text: str, language: str) -> str:
-    # Salvage only the public answer. Invalid diagnostic metadata must not be
-    # promoted into a validated diagnosis or rendered as learner-facing text.
-    try:
-        answer = _parse_output_object(text).get("answer")
-        if isinstance(answer, str) and answer.strip() and len(answer) <= 12_000:
-            return answer
-    except ValueError:
-        pass
-    if language.lower().startswith("zh"):
-        return "暂时无法生成完整回答，请稍后重试。"
-    return "I couldn't generate a complete answer. Please try again."
+    assessment = DiagnosticAssessment.model_validate(payload)
+    if not assessment.diagnosis.summary.strip():
+        raise ValueError("Assessment summary must not be blank")
+    return assessment
 
 
 def _tool_message(call_id: str, payload: dict[str, Any]) -> ProviderMessage:
