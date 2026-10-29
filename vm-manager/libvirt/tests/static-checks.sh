@@ -30,6 +30,14 @@ grep -q 'https://packages.mozilla.org/apt' "$ROOT/scripts/build-base-image.sh"
 grep -q '35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3' \
   "$ROOT/scripts/build-base-image.sh"
 grep -q '/etc/aivirteach/browser-ready' "$ROOT/scripts/build-base-image.sh"
+grep -q '/etc/xdg/xfce4/terminal/terminalrc' \
+  "$ROOT/scripts/build-base-image.sh"
+grep -q 'MiscShowUnsafePasteDialog=FALSE' \
+  "$ROOT/scripts/build-base-image.sh"
+grep -q '/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml' \
+  "$ROOT/scripts/build-base-image.sh"
+grep -q 'misc-show-unsafe-paste-dialog.*value="false"' \
+  "$ROOT/scripts/build-base-image.sh"
 grep -q 'image-style.*value="4"' "$ROOT/scripts/build-base-image.sh"
 grep -q 'color-style.*value="0"' "$ROOT/scripts/build-base-image.sh"
 grep -q 'property name="rgba1" type="array"' \

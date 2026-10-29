@@ -10,7 +10,7 @@ from aivirteach_agent.app import build_provider, create_app
 from aivirteach_agent.config import Settings
 from aivirteach_agent.models import DiagnoseRequest, ToolName
 from aivirteach_agent.orchestrator import AgentOrchestrator, _parse_draft
-from aivirteach_agent.prompts import SYSTEM_PROMPT
+from aivirteach_agent.prompts import ANSWER_RENDER_SYSTEM_PROMPT, SYSTEM_PROMPT
 from aivirteach_agent.providers import (
     FakeProvider,
     OpenAICompatibleProvider,
@@ -99,6 +99,17 @@ class ProgressSnapshotPromptTests(unittest.TestCase):
         self.assertIn("learner_state.vm_progress", SYSTEM_PROMPT)
         self.assertIn("instead of calling tools merely to re-check course completion", SYSTEM_PROMPT)
 
+    def test_zero_progress_does_not_block_pre_lesson_questions(self) -> None:
+        self.assertIn("Course-start status is not an access-control condition", SYSTEM_PROMPT)
+        self.assertIn("a progressPercent of 0", SYSTEM_PROMPT)
+        self.assertIn("Do not refuse, defer", SYSTEM_PROMPT)
+        self.assertIn("default first-lesson context", SYSTEM_PROMPT)
+        self.assertIn(
+            "Course-start status is not an access-control condition",
+            ANSWER_RENDER_SYSTEM_PROMPT,
+        )
+        self.assertIn("before answering", ANSWER_RENDER_SYSTEM_PROMPT)
+
 
 class AgentApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -178,6 +189,40 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "completed")
         self.assertIn("FAKE_MODEL_PROVIDER", response.json()["limitations"])
+
+    async def test_zero_progress_pre_lesson_question_reaches_provider(self) -> None:
+        payload = request_payload()
+        payload["current_step"]["sequence"] = 1
+        payload["learner_state"] = {
+            "currentLessonId": "install-docker",
+            "progressPercent": 0,
+            "courseCompleted": False,
+            "vm_progress": {
+                "highest_contiguous_checkpoint": None,
+                "completed_checkpoint_count": 0,
+                "last_observed_at": None,
+                "stale": True,
+                "checkpoints": [
+                    {
+                        "checkpoint_id": "P01",
+                        "lesson_id": "install-docker",
+                        "state": "unknown",
+                        "achieved": False,
+                    }
+                ],
+            },
+        }
+
+        response = await self.client.post(
+            "/v1/agent/diagnose",
+            headers={"Authorization": "Bearer agent-token"},
+            json=payload,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertTrue(response.json()["answer"])
+        self.assertEqual(self.gateway.calls, [])
 
     async def test_sse_stream_emits_progress_and_validated_result(self) -> None:
         response = await self.client.post(

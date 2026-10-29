@@ -380,6 +380,23 @@ x-scheme-handler/http=firefox.desktop
 x-scheme-handler/https=firefox.desktop
 MIMEAPPS
 
+# Jammy's XFCE Terminal reads terminalrc; Noble uses the Xfconf channel.
+install -d -m 0755 /etc/xdg/xfce4/terminal
+cat > /etc/xdg/xfce4/terminal/terminalrc <<'XFCE_TERMINAL_LEGACY_DEFAULTS'
+[Configuration]
+MiscShowUnsafePasteDialog=FALSE
+XFCE_TERMINAL_LEGACY_DEFAULTS
+chmod 0644 /etc/xdg/xfce4/terminal/terminalrc
+
+install -d -m 0755 /etc/xdg/xfce4/xfconf/xfce-perchannel-xml
+cat > /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml <<'XFCE_TERMINAL_DEFAULTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-terminal" version="1.0">
+  <property name="misc-show-unsafe-paste-dialog" type="bool" value="false"/>
+</channel>
+XFCE_TERMINAL_DEFAULTS
+chmod 0644 /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml
+
 install -d -m 0755 /etc/aivirteach /opt/aivirteach /home/learner/course
 printf '%s\n' \
   'unset DBUS_SESSION_BUS_ADDRESS' \
