@@ -108,7 +108,24 @@ write_files:
     permissions: "0600"
     content: |
       ${LAB_ID}
+  - path: /etc/xdg/xfce4/terminal/terminalrc
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Configuration]
+      MiscShowUnsafePasteDialog=FALSE
+  - path: /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <channel name="xfce4-terminal" version="1.0">
+        <property name="misc-show-unsafe-paste-dialog" type="bool" value="false"/>
+      </channel>
 runcmd:
+  - [bash, -lc, "install -d -m 0755 -o learner -g learner /home/learner/.config /home/learner/.config/xfce4 /home/learner/.config/xfce4/terminal /home/learner/.config/xfce4/xfconf /home/learner/.config/xfce4/xfconf/xfce-perchannel-xml"]
+  - [bash, -lc, "install -m 0644 -o learner -g learner /etc/xdg/xfce4/terminal/terminalrc /home/learner/.config/xfce4/terminal/terminalrc"]
+  - [bash, -lc, "install -m 0644 -o learner -g learner /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml /home/learner/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-terminal.xml"]
   - [bash, -lc, "ssh-keygen -A"]
   - [bash, -lc, "usermod -U learner || true"]
   - [bash, -lc, "systemctl restart ssh qemu-guest-agent xrdp || true"]

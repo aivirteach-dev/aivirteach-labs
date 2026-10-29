@@ -114,6 +114,10 @@ identity, powers off, and publishes:
 /var/lib/libvirt/images/aivirteach/base/ubuntu-24.04-xfce-xrdp-v3.qcow2
 ```
 
+The golden-image defaults and each learner VM's cloud-init both disable XFCE
+Terminal's unsafe-paste confirmation dialog. The per-VM configuration also
+applies when a learner VM is created from an older compatible golden image.
+
 The build refuses to publish unless `/etc/aivirteach/browser-ready` records a
 Firefox DEB from `packages.mozilla.org`. The Mozilla signing key is also checked
 against the expected fingerprint during the build.
