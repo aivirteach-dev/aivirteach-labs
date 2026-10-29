@@ -17,6 +17,9 @@ scripts/install-host.sh
 scripts/build-base-image.sh
 scripts/create-learner-vm.sh
 scripts/vm-control.sh
+course-images/<course>/manifest.json
+course-images/<course>/provision.sh
+course-images/<course>/checks/
 templates/customize-image.example.sh
 tests/static-checks.sh
 ```
@@ -81,17 +84,39 @@ CUSTOMIZE_SCRIPT="/absolute/path/to/customize-image.sh"
 
 Never embed production tokens or private keys in the golden image.
 
+The general image can also install a project-owned JPG or PNG as both the XFCE
+desktop wallpaper and LightDM background. Keep the asset under `general/` and
+set, for example:
+
+```bash
+WALLPAPER_IMAGE="${MODULE_DIR}/general/logo.jpg"
+GOLDEN_IMAGE_NAME="ubuntu-24.04-xfce-xrdp-v3.qcow2"
+```
+
+The image is shown with XFCE's **Scaled** style over a solid white background;
+wallpaper cycling is disabled. Defaults for the common XRDP and virtio monitor
+names are seeded before first login, then a one-time login helper updates every
+runtime monitor/workspace property that XFCE creates. Learners may change the
+wallpaper afterward.
+
 ## 3. Build the golden qcow2 image
 
 ```bash
 ./scripts/build-base-image.sh
 ```
 
-The script downloads the current released Ubuntu 24.04 cloud image, verifies `SHA256SUMS`, starts a builder VM, installs XFCE/XRDP, cleans clone-specific identity, powers off, and publishes:
+The script downloads the current released Ubuntu 24.04 cloud image, verifies
+`SHA256SUMS`, starts a builder VM, installs XFCE/XRDP and Mozilla's signed
+Firefox DEB package, validates that Firefox is not a Snap, cleans clone-specific
+identity, powers off, and publishes:
 
 ```text
-/var/lib/libvirt/images/aivirteach/base/ubuntu-24.04-xfce-xrdp-v1.qcow2
+/var/lib/libvirt/images/aivirteach/base/ubuntu-24.04-xfce-xrdp-v3.qcow2
 ```
+
+The build refuses to publish unless `/etc/aivirteach/browser-ready` records a
+Firefox DEB from `packages.mozilla.org`. The Mozilla signing key is also checked
+against the expected fingerprint during the build.
 
 Monitor:
 
@@ -108,7 +133,87 @@ Force rebuild:
 ./scripts/build-base-image.sh --force
 ```
 
+The downloaded Ubuntu cloud image is cached under `BASE_DIR`. Every build
+refreshes only the small codename-specific checksum file and verifies the local
+image. If the checksum matches, `--force` reuses the cached image instead of
+downloading it again. To intentionally fetch a fresh source image, use:
+
+```bash
+./scripts/build-base-image.sh --force --refresh-source
+```
+
+If checksum metadata cannot be refreshed, the normal mode may use previously
+cached metadata; `--refresh-source` always fails closed instead of trusting a
+stale checksum.
+
+Do not force-replace a base image while learner overlays depend on it. Use a new
+versioned filename instead.
+
+### Browser acceptance test
+
+After creating and starting a new learner VM from v3, run inside that VM:
+
+```bash
+cat /etc/aivirteach/browser-ready
+/usr/local/bin/aivirteach-browser-smoke-test
+```
+
+The smoke test runs as `learner` even when invoked by the root QEMU Guest Agent,
+rejects Snap Firefox, and uses headless Firefox to render `https://example.com/`.
+A successful result starts with:
+
+```text
+browser_smoke_status=passed
+```
+
+From the host, confirm that the new overlay actually uses v3:
+
+```bash
+sudo qemu-img info /var/lib/libvirt/images/aivirteach/labs/LAB_ID.qcow2 \
+  | grep 'backing file'
+```
+
 The build script refuses `--force` while any learner overlays exist. Publish versioned images instead of replacing an in-use base.
+
+### Course-specific golden image example
+
+`course-images/AI Daily Briefing/` demonstrates how a reviewed course bundle is embedded during the golden-image build. The Markdown remains source guidance; the builder executes only the reviewed `provision.sh` and installs the read-only checkpoint scripts.
+
+Validate the bundle without creating a VM:
+
+```bash
+./course-images/AI\ Daily\ Briefing/tests/test-checks.sh
+./scripts/build-base-image.sh --validate-only \
+  --course-image-dir "$PWD/course-images/AI Daily Briefing"
+```
+
+Build its Ubuntu 22.04 course image:
+
+```bash
+sudo ./scripts/build-base-image.sh \
+  --course-image-dir "$PWD/course-images/AI Daily Briefing"
+```
+
+The course bundle must stay under `course-images/`, contain no symlinks or likely secret files, use at most 128 files, and be at most 5 MiB uncompressed. Build settings are read non-executably from allowlisted fields in `manifest.json`. The image is published only after the powered-off builder disk contains markers matching the image name, course ID, and bundle SHA-256.
+
+Inside a VM created from that image, a checkpoint can be queried with:
+
+```bash
+sudo /usr/local/bin/aivirteach-check-step P04
+```
+
+The host does not ask the learner to self-report this result. Progress Worker
+calls the Diagnostic Gateway, which invokes the fixed batch dispatcher through
+QEMU Guest Agent:
+
+```text
+/usr/local/bin/aivirteach-check-progress P01 P02
+```
+
+The Gateway requires the Server-owned VM UUID and accepts only checkpoint IDs
+as tool parameters; it returns normalized JSON without raw stdout/stderr.
+
+See `course-images/AI Daily Briefing/README.md` for the supported checkpoint boundary. The VM API does not yet map `course_id` to this golden image automatically.
 
 ## 4. Create a learner VM
 
@@ -125,7 +230,18 @@ Optional resources and SSH key:
   --ssh-key "$HOME/.ssh/id_ed25519.pub"
 ```
 
-The command prints the learner's generated RDP password. A protected copy is stored at:
+When using an explicitly selected custom base image, pass its Ubuntu release as well so libosinfo metadata matches the guest:
+
+```bash
+./scripts/create-learner-vm.sh lab-course-demo \
+  --base-image /var/lib/libvirt/images/aivirteach/base/CUSTOM.qcow2 \
+  --os-release 22.04
+```
+
+The command prints the learner's generated RDP password and immutable libvirt
+domain UUID (`VM instance ID`). The UUID is also returned as `vm_instance_id`
+by `POST /v1/vms`; use it in the Server's progress assignment so a deleted and
+recreated `lab-001` cannot inherit stale events. A protected copy is stored at:
 
 ```text
 /var/lib/aivirteach-labs/lab-001/credentials.txt

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "courseId": "ai-daily-briefing-v2",
+  "sourceDocument": "AI Daily Briefing.md",
+  "image": {
+    "os": "Ubuntu 22.04",
+    "ubuntuRelease": "22.04",
+    "ubuntuCodename": "jammy",
+    "ubuntuImageName": "ubuntu-22.04-server-cloudimg-amd64.img",
+    "ubuntuImageBaseUrl": "https://cloud-images.ubuntu.com/releases/jammy/release",
+    "goldenImage": "ai-daily-briefing-v2-ubuntu-22.04-v1.qcow2",
+    "goldenImageSize": "40G",
+    "builderVmName": "avt-ai-daily-briefing-builder",
+    "builderMemoryMb": 4096,
+    "builderVcpus": 2,
+    "buildTimeoutSeconds": 3600,
+    "n8nTargetVersion": "2.31.7"
+  },
+  "workspace": "/home/learner/aivirteach/ai-daily-briefing",
+  "checkpointPolicy": {
+    "guestProbe": ["P01", "P02", "P03", "P04", "P05", "P06", "P07"],
+    "platformOrBrowserConfirmationRequired": ["P07"],
+    "n8nObserverRequired": [
+      "P08", "P09", "P10", "P11", "P12", "P13", "P14", "P15",
+      "P16", "P17", "P18", "P19", "P20", "P21", "P22", "P23", "P24"
+    ],
+    "externalConfirmationRequired": ["P21", "P24"],
+    "requiredEvidenceByCheckpoint": {
+      "P07": ["guest-http", "platform-or-browser"],
+      "P21": ["n8n-execution", "receipt"],
+      "P24": ["n8n-execution", "receipt"]
+    },
+    "highestProgressRule": "highest contiguous passed checkpoint"
+  },
+  "guestChecks": {
+    "P01": "checks/P01-docker-ready.sh",
+    "P02": "checks/P02-project-directory.sh",
+    "P03": "checks/P03-docker-volume.sh",
+    "P04": "checks/P04-compose-config.sh",
+    "P05": "checks/P05-container-running.sh",
+    "P06": "checks/P06-n8n-readiness.sh",
+    "P07": "checks/P07-editor-reachable.sh"
+  },
+  "missingRequiredCourseAssets": [
+    "AI_Daily_Briefing_Gemini_Code_No_Comments.txt"
+  ],
+  "security": {
+    "collectSecrets": false,
+    "guestChecksAreReadOnly": true,
+    "antiCheatBoundary": false
+  }
+}

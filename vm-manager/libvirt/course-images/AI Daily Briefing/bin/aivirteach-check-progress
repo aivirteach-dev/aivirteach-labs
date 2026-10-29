@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CHECK_STEP="/usr/local/bin/aivirteach-check-step"
+COURSE_ID="${AIVIRTEACH_COURSE_ID:-}"
+if [[ -z "$COURSE_ID" && -r /etc/aivirteach/course-id ]]; then
+  COURSE_ID="$(</etc/aivirteach/course-id)"
+fi
+
+fail() {
+  printf '%s\n' "Course progress check failed." >&2
+  exit 2
+}
+
+[[ "$COURSE_ID" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]] || fail
+(( $# >= 1 && $# <= 24 )) || fail
+
+declare -A seen=()
+checkpoint_ids=()
+for checkpoint_id in "$@"; do
+  [[ "$checkpoint_id" =~ ^P(0[1-9]|1[0-9]|2[0-4])$ ]] || fail
+  [[ -z "${seen[$checkpoint_id]:-}" ]] || fail
+  seen[$checkpoint_id]=1
+  checkpoint_ids+=("$checkpoint_id")
+done
+
+observations='[]'
+for checkpoint_id in "${checkpoint_ids[@]}"; do
+  set +e
+  raw_result="$("$CHECK_STEP" "$checkpoint_id" 2>/dev/null)"
+  checker_rc=$?
+  set -e
+
+  case "$checker_rc" in
+    0) expected_state="passed" ;;
+    1) expected_state="failed" ;;
+    2) expected_state="unknown" ;;
+    *) fail ;;
+  esac
+  (( ${#raw_result} <= 4096 )) || fail
+
+  normalized="$({
+    jq -ce \
+      --arg course_id "$COURSE_ID" \
+      --arg checkpoint_id "$checkpoint_id" \
+      --arg expected_state "$expected_state" '
+        select(
+          type == "object" and
+          .schemaVersion == 1 and
+          .courseId == $course_id and
+          .checkpointId == $checkpoint_id and
+          .state == $expected_state and
+          (.observedAt | type == "string" and length > 0 and length <= 64) and
+          (.evidenceType | type == "string" and length > 0 and length <= 64) and
+          (.evidenceSummary | type == "string" and length > 0 and length <= 512) and
+          (.facts | type == "object")
+        ) |
+        {
+          schema_version: 1,
+          course_id: .courseId,
+          checkpoint_id: .checkpointId,
+          state: .state,
+          evidence_type: .evidenceType,
+          summary: .evidenceSummary,
+          facts: .facts
+        }
+      ' <<<"$raw_result"
+  } 2>/dev/null)" || fail
+  [[ -n "$normalized" && ${#normalized} -le 4096 ]] || fail
+  observations="$(jq -cn \
+    --argjson observations "$observations" \
+    --argjson observation "$normalized" \
+    '$observations + [$observation]')" || fail
+done
+
+jq -cn \
+  --arg course_id "$COURSE_ID" \
+  --argjson observations "$observations" \
+  '{schema_version:1,course_id:$course_id,observations:$observations}'

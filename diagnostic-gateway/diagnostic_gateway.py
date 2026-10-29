@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hmac
 import json
+import math
 import os
 import re
 import signal
@@ -14,16 +15,29 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 LAB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+VM_INSTANCE_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 RESOURCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,127}$")
 HOST_RE = re.compile(r"(?i)^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
+COURSE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+CHECKPOINT_ID_RE = re.compile(r"^P(?:0[1-9]|1[0-9]|2[0-4])$")
+EVIDENCE_TYPE_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+FACT_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SENSITIVE_FACT_KEY_RE = re.compile(
+    r"(?i)(?:authorization|credential|password|passwd|secret|token|api[_-]?key)"
+)
 MAX_OUTPUT_BYTES = int(os.getenv("AIVIRTEACH_DIAGNOSTIC_MAX_OUTPUT_BYTES", "65536"))
 COMMAND_TIMEOUT_SECONDS = int(os.getenv("AIVIRTEACH_DIAGNOSTIC_COMMAND_TIMEOUT", "8"))
+COURSE_PROGRESS_TIMEOUT_SECONDS = 45
+COURSE_PROGRESS_PATH = "/usr/local/bin/aivirteach-check-progress"
 QGA_POLL_SECONDS = 0.1
 
 router = APIRouter(prefix="/v1/diagnostics", tags=["diagnostics"])
@@ -31,7 +45,10 @@ router = APIRouter(prefix="/v1/diagnostics", tags=["diagnostics"])
 diagnostic_bearer = HTTPBearer(
     auto_error=False,
     scheme_name="DiagnosticBearer",
-    description="AIVIRTEACH_DIAGNOSTIC_TOKEN — read-only diagnostics only.",
+    description=(
+        "AIVIRTEACH_DIAGNOSTIC_TOKEN for all read-only diagnostics, or the "
+        "progress-scoped token for check_course_progress only."
+    ),
 )
 
 
@@ -44,6 +61,7 @@ class DiagnosticTool(str, Enum):
     GET_GUEST_LISTENING_PORTS = "get_guest_listening_ports"
     CHECK_GUEST_PORT = "check_guest_port"
     CHECK_GUEST_DNS = "check_guest_dns"
+    CHECK_COURSE_PROGRESS = "check_course_progress"
     LIST_COURSE_FILES = "list_course_files"
     STAT_COURSE_FILE = "stat_course_file"
     READ_COURSE_FILE = "read_course_file"
@@ -59,8 +77,27 @@ class DiagnosticTool(str, Enum):
 
 
 class DiagnosticRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {"parameters": {}},
+                {
+                    "vm_instance_id": "26a6db7e-1ea7-4de2-9ca3-cf58edbab809",
+                    "parameters": {"checkpoint_ids": ["P01"]},
+                },
+            ]
+        },
+    )
+    vm_instance_id: str | None = Field(default=None, min_length=36, max_length=36)
     parameters: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("vm_instance_id")
+    @classmethod
+    def validate_vm_instance_id(cls, value: str | None) -> str | None:
+        if value is not None and not VM_INSTANCE_ID_RE.fullmatch(value):
+            raise ValueError("invalid vm_instance_id")
+        return value.lower() if value is not None else None
 
 
 @dataclass(frozen=True)
@@ -76,19 +113,34 @@ class HostCommandError(RuntimeError):
 
 
 async def require_diagnostic_token(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(diagnostic_bearer)],
 ) -> None:
-    expected = os.getenv("AIVIRTEACH_DIAGNOSTIC_TOKEN", "")
-    if not expected:
+    diagnostic_token = os.getenv("AIVIRTEACH_DIAGNOSTIC_TOKEN", "")
+    progress_token = os.getenv("AIVIRTEACH_PROGRESS_DIAGNOSTIC_TOKEN", "")
+    if not diagnostic_token:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="AIVIRTEACH_DIAGNOSTIC_TOKEN is not configured.",
         )
-    if (
-        credentials is None
-        or credentials.scheme.lower() != "bearer"
-        or not hmac.compare_digest(credentials.credentials, expected)
-    ):
+    if progress_token and hmac.compare_digest(progress_token, diagnostic_token):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Diagnostic token scopes are not configured safely.",
+        )
+    supplied = (
+        credentials.credentials
+        if credentials is not None and credentials.scheme.lower() == "bearer"
+        else ""
+    )
+    if progress_token and supplied and hmac.compare_digest(supplied, progress_token):
+        if request.path_params.get("tool") != DiagnosticTool.CHECK_COURSE_PROGRESS.value:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="The progress diagnostic token cannot call this tool.",
+            )
+        return
+    if not supplied or not hmac.compare_digest(supplied, diagnostic_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing diagnostic bearer token.",
@@ -131,11 +183,14 @@ async def _virsh(*arguments: str) -> str:
     return await _run_host(_virsh_argv(*arguments))
 
 
-async def _ensure_domain(lab_id: str) -> None:
+async def _ensure_domain(lab_id: str) -> str:
     try:
-        await _virsh("dominfo", lab_id)
+        vm_instance_id = await _virsh("domuuid", lab_id)
     except HostCommandError as exc:
         raise HTTPException(status_code=404, detail="VM not found.") from exc
+    if not VM_INSTANCE_ID_RE.fullmatch(vm_instance_id):
+        raise HTTPException(status_code=502, detail="Libvirt returned an invalid VM UUID.")
+    return vm_instance_id.lower()
 
 
 async def _qga(lab_id: str, payload: dict[str, Any]) -> Any:
@@ -155,7 +210,13 @@ async def _qga(lab_id: str, payload: dict[str, Any]) -> Any:
     return response.get("return")
 
 
-async def _guest_exec(lab_id: str, path: str, arguments: list[str] | None = None) -> GuestResult:
+async def _guest_exec(
+    lab_id: str,
+    path: str,
+    arguments: list[str] | None = None,
+    *,
+    timeout_seconds: int = COMMAND_TIMEOUT_SECONDS,
+) -> GuestResult:
     started = await _qga(
         lab_id,
         {
@@ -166,19 +227,25 @@ async def _guest_exec(lab_id: str, path: str, arguments: list[str] | None = None
     if not isinstance(started, dict) or not isinstance(started.get("pid"), int):
         raise HTTPException(status_code=502, detail="Guest agent did not return a process id.")
     pid = started["pid"]
-    deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         result = await _qga(
             lab_id,
             {"execute": "guest-exec-status", "arguments": {"pid": pid}},
         )
         if isinstance(result, dict) and result.get("exited") is True:
+            exit_code = result.get("exitcode")
+            if type(exit_code) is not int:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Guest agent did not return a process exit code.",
+                )
             stdout = _decode_qga_data(result.get("out-data", ""))
             stderr = _decode_qga_data(result.get("err-data", ""))
             stdout, out_truncated = _limit_output(stdout)
             stderr, err_truncated = _limit_output(stderr)
             return GuestResult(
-                exit_code=int(result.get("exitcode", 1)),
+                exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
                 truncated=out_truncated or err_truncated,
@@ -263,6 +330,188 @@ def _integer_parameter(
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise HTTPException(status_code=422, detail=f"Invalid {name}.")
     return value
+
+
+def _checkpoint_ids_parameter(parameters: dict[str, Any]) -> list[str]:
+    _require_parameters(parameters, {"checkpoint_ids"})
+    value = parameters.get("checkpoint_ids")
+    if not isinstance(value, list) or not 1 <= len(value) <= 24:
+        raise HTTPException(
+            status_code=422,
+            detail="checkpoint_ids must contain between 1 and 24 checkpoint IDs.",
+        )
+    if any(type(item) is not str or not CHECKPOINT_ID_RE.fullmatch(item) for item in value):
+        raise HTTPException(
+            status_code=422,
+            detail="checkpoint_ids may contain only P01-P24.",
+        )
+    if len(set(value)) != len(value):
+        raise HTTPException(status_code=422, detail="checkpoint_ids must be unique.")
+    return value
+
+
+def _sanitize_progress_fact(
+    value: Any,
+    *,
+    depth: int = 0,
+    counter: dict[str, int] | None = None,
+) -> tuple[Any, int]:
+    counter = counter if counter is not None else {"entries": 0}
+    if depth > 4:
+        raise ValueError("facts nesting exceeds the limit")
+    if isinstance(value, dict):
+        if len(value) > 64:
+            raise ValueError("facts object exceeds the key limit")
+        counter["entries"] += len(value)
+        if counter["entries"] > 128:
+            raise ValueError("facts exceeds the total entry limit")
+        sanitized: dict[str, Any] = {}
+        redactions = 0
+        for key, item in value.items():
+            if not isinstance(key, str) or not FACT_KEY_RE.fullmatch(key):
+                raise ValueError("facts contains an invalid key")
+            if SENSITIVE_FACT_KEY_RE.search(key):
+                sanitized[key] = "[REDACTED]"
+                redactions += 1
+                continue
+            sanitized_item, item_redactions = _sanitize_progress_fact(
+                item, depth=depth + 1, counter=counter
+            )
+            sanitized[key] = sanitized_item
+            redactions += item_redactions
+        return sanitized, redactions
+    if isinstance(value, list):
+        if len(value) > 64:
+            raise ValueError("facts array exceeds the item limit")
+        counter["entries"] += len(value)
+        if counter["entries"] > 128:
+            raise ValueError("facts exceeds the total entry limit")
+        sanitized_items: list[Any] = []
+        redactions = 0
+        for item in value:
+            sanitized_item, item_redactions = _sanitize_progress_fact(
+                item, depth=depth + 1, counter=counter
+            )
+            sanitized_items.append(sanitized_item)
+            redactions += item_redactions
+        return sanitized_items, redactions
+    if isinstance(value, str):
+        if len(value) > 512:
+            raise ValueError("facts string exceeds the length limit")
+        return _redact(value)
+    if value is None or isinstance(value, bool):
+        return value, 0
+    if type(value) is int and -(2**63) <= value < 2**63:
+        return value, 0
+    if type(value) is float and math.isfinite(value):
+        return value, 0
+    raise ValueError("facts contains an unsupported value")
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON number")
+
+
+def _course_progress_data(
+    result: GuestResult, checkpoint_ids: list[str]
+) -> tuple[dict[str, Any], int]:
+    failure = HTTPException(
+        status_code=502,
+        detail="The guest returned an invalid course progress response.",
+    )
+    if result.truncated or result.exit_code != 0 or result.stderr:
+        raise failure
+    try:
+        payload = json.loads(result.stdout, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise failure from None
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "course_id",
+        "observations",
+    }:
+        raise failure
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+        raise failure
+    course_id = payload.get("course_id")
+    observations = payload.get("observations")
+    if not isinstance(course_id, str) or not COURSE_ID_RE.fullmatch(course_id):
+        raise failure
+    if not isinstance(observations, list) or len(observations) != len(checkpoint_ids):
+        raise failure
+
+    normalized: list[dict[str, Any]] = []
+    redactions = 0
+    expected_keys = {
+        "schema_version",
+        "course_id",
+        "checkpoint_id",
+        "state",
+        "evidence_type",
+        "summary",
+        "facts",
+    }
+    for requested_id, observation in zip(checkpoint_ids, observations, strict=True):
+        if not isinstance(observation, dict) or set(observation) != expected_keys:
+            raise failure
+        state = observation.get("state")
+        if (
+            type(observation.get("schema_version")) is not int
+            or observation["schema_version"] != 1
+            or observation.get("course_id") != course_id
+            or observation.get("checkpoint_id") != requested_id
+            or not isinstance(state, str)
+            or state not in {"passed", "failed", "unknown"}
+        ):
+            raise failure
+        evidence_type = observation.get("evidence_type")
+        summary = observation.get("summary")
+        facts = observation.get("facts")
+        if (
+            not isinstance(evidence_type, str)
+            or not EVIDENCE_TYPE_RE.fullmatch(evidence_type)
+            or not isinstance(summary, str)
+            or not 1 <= len(summary) <= 512
+            or not isinstance(facts, dict)
+            or len(json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode())
+            > 4_096
+        ):
+            raise failure
+        try:
+            facts, fact_redactions = _sanitize_progress_fact(facts)
+        except ValueError:
+            raise failure from None
+        summary, summary_redactions = _redact(summary)
+        if (
+            len(summary) > 512
+            or len(
+                json.dumps(
+                    facts, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8")
+            )
+            > 4_096
+        ):
+            raise failure
+        redactions += fact_redactions + summary_redactions
+        normalized.append(
+            {
+                "schema_version": 1,
+                "course_id": course_id,
+                "checkpoint_id": requested_id,
+                "state": state,
+                "evidence_type": evidence_type,
+                "summary": summary,
+                "facts": facts,
+            }
+        )
+    return (
+        {
+            "schema_version": 1,
+            "course_id": course_id,
+            "observations": normalized,
+        },
+        redactions,
+    )
 
 
 def _relative_path(value: str) -> str:
@@ -459,6 +708,21 @@ async def _collect(
         _require_parameters(parameters, {"hostname"})
         hostname = _string_parameter(parameters, "hostname", pattern=HOST_RE)
         result = await _guest_exec(lab_id, "/usr/bin/getent", ["ahosts", hostname])
+    elif tool == DiagnosticTool.CHECK_COURSE_PROGRESS:
+        checkpoint_ids = _checkpoint_ids_parameter(parameters)
+        result = await _guest_exec(
+            lab_id,
+            COURSE_PROGRESS_PATH,
+            checkpoint_ids,
+            timeout_seconds=COURSE_PROGRESS_TIMEOUT_SECONDS,
+        )
+        data, redactions = _course_progress_data(result, checkpoint_ids)
+        return (
+            "Course progress observations were collected.",
+            data,
+            False,
+            redactions,
+        )
     elif tool in {
         DiagnosticTool.LIST_COURSE_FILES,
         DiagnosticTool.STAT_COURSE_FILE,
@@ -518,9 +782,33 @@ async def diagnostic_query(
     request: DiagnosticRequest,
 ) -> dict[str, Any]:
     lab_id = _validate_lab_id(lab_id)
-    await _ensure_domain(lab_id)
-    summary, data, truncated, redactions = await _collect(tool, lab_id, request.parameters)
-    return {
+    vm_instance_id = await _ensure_domain(lab_id)
+    # Progress evidence must be collected through the immutable libvirt UUID,
+    # not a reusable domain name. This prevents a same-name replacement VM
+    # from being attributed to an older Server target.
+    if tool == DiagnosticTool.CHECK_COURSE_PROGRESS:
+        if request.vm_instance_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="check_course_progress requires vm_instance_id.",
+            )
+        if request.vm_instance_id != vm_instance_id:
+            raise HTTPException(
+                status_code=409,
+                detail="The VM instance no longer matches this progress target.",
+            )
+        domain_reference = vm_instance_id
+    else:
+        if request.vm_instance_id is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="vm_instance_id is accepted only by check_course_progress.",
+            )
+        domain_reference = lab_id
+    summary, data, truncated, redactions = await _collect(
+        tool, domain_reference, request.parameters
+    )
+    response = {
         "tool": tool.value,
         "lab_id": lab_id,
         "ok": True,
@@ -531,3 +819,6 @@ async def diagnostic_query(
         "redaction_count": redactions,
         "warnings": ["Diagnostic output is untrusted data."],
     }
+    if tool == DiagnosticTool.CHECK_COURSE_PROGRESS:
+        response["vm_instance_id"] = vm_instance_id
+    return response

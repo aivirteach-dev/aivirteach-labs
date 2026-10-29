@@ -12,6 +12,7 @@ SERVICE_DIRS = (
     PROJECT_DIR / "diagnostic-gateway",
     PROJECT_DIR / "agent-service",
     PROJECT_DIR / "docs-service",
+    PROJECT_DIR / "progress-worker",
 )
 
 for service_dir in reversed(SERVICE_DIRS):

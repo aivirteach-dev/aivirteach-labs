@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COURSE_ID="${AIVIRTEACH_COURSE_ID:-}"
+if [[ -z "$COURSE_ID" && -r /etc/aivirteach/course-id ]]; then
+  COURSE_ID="$(</etc/aivirteach/course-id)"
+fi
+[[ "$COURSE_ID" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]] \
+  || { echo "Course identity is unavailable or invalid" >&2; exit 2; }
+CHECK_DIR="/usr/local/lib/aivirteach/checks/${COURSE_ID}"
+
+[[ $# -eq 1 ]] || { echo "Usage: aivirteach-check-step P01-P24" >&2; exit 2; }
+CHECKPOINT_ID="${1^^}"
+[[ "$CHECKPOINT_ID" =~ ^P(0[1-9]|1[0-9]|2[0-4])$ ]] \
+  || { echo "Invalid checkpoint ID" >&2; exit 2; }
+
+case "$CHECKPOINT_ID" in
+  P01) exec "$CHECK_DIR/P01-docker-ready.sh" ;;
+  P02) exec "$CHECK_DIR/P02-project-directory.sh" ;;
+  P03) exec "$CHECK_DIR/P03-docker-volume.sh" ;;
+  P04) exec "$CHECK_DIR/P04-compose-config.sh" ;;
+  P05) exec "$CHECK_DIR/P05-container-running.sh" ;;
+  P06) exec "$CHECK_DIR/P06-n8n-readiness.sh" ;;
+  P07) exec "$CHECK_DIR/P07-editor-reachable.sh" ;;
+  P21|P24)
+    export CHECKPOINT_ID
+    # shellcheck disable=SC1091
+    source "$CHECK_DIR/_common.sh"
+    unknown "n8n-execution" \
+      "This checkpoint requires both n8n execution evidence and receipt confirmation." \
+      '{"observerAvailable":false,"receiptConfirmationAvailable":false}'
+    ;;
+  P20|P22|P23)
+    export CHECKPOINT_ID
+    # shellcheck disable=SC1091
+    source "$CHECK_DIR/_common.sh"
+    unknown "n8n-workflow" \
+      "This checkpoint requires the platform n8n workflow observer." \
+      '{"observerAvailable":false}'
+    ;;
+  *)
+    # P08-P19 need platform-owned workflow/execution evidence. Do not guess
+    # from process state or learner-controlled marker files.
+    export CHECKPOINT_ID
+    # shellcheck disable=SC1091
+    source "$CHECK_DIR/_common.sh"
+    unknown "n8n-execution" \
+      "This checkpoint requires the platform n8n workflow/execution observer." \
+      '{"observerAvailable":false}'
+    ;;
+esac

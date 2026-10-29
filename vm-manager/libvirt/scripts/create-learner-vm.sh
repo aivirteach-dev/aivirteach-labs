@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 
 usage() {
   cat <<USAGE
-Usage: $0 LAB_ID [--password VALUE] [--ssh-key FILE] [--memory MB] [--vcpus N] [--base-image PATH] [--autostart]
+Usage: $0 LAB_ID [--password VALUE] [--ssh-key FILE] [--memory MB] [--vcpus N] [--base-image PATH] [--os-release VERSION] [--autostart]
 USAGE
 }
 
@@ -20,6 +20,7 @@ SSH_KEY_FILE=""
 MEMORY_MB="$LEARNER_MEMORY_MB"
 VCPUS="$LEARNER_VCPUS"
 BASE_IMAGE="${BASE_DIR}/${GOLDEN_IMAGE_NAME}"
+OS_RELEASE="$UBUNTU_RELEASE"
 AUTOSTART=false
 
 while [[ $# -gt 0 ]]; do
@@ -29,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --memory) MEMORY_MB="${2:?Missing memory}"; shift ;;
     --vcpus) VCPUS="${2:?Missing vCPUs}"; shift ;;
     --base-image) BASE_IMAGE="${2:?Missing image path}"; shift ;;
+    --os-release) OS_RELEASE="${2:?Missing OS release}"; shift ;;
     --autostart) AUTOSTART=true ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
@@ -36,11 +38,14 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+[[ "$OS_RELEASE" =~ ^[0-9]{2}\.[0-9]{2}$ ]] \
+  || die "OS release must look like 22.04 or 24.04."
+
 require_root_or_sudo
 for cmd in qemu-img cloud-localds virt-install virsh openssl; do require_command "$cmd"; done
 [[ -f "$BASE_IMAGE" ]] || die "Golden image not found: $BASE_IMAGE"
 [[ -z "$SSH_KEY_FILE" || -f "$SSH_KEY_FILE" ]] || die "SSH key not found: $SSH_KEY_FILE"
-! as_root virsh --connect qemu:///system dominfo "$LAB_ID" >/dev/null 2>&1 || die "VM already exists: $LAB_ID"
+if domain_exists "$LAB_ID"; then die "VM already exists: $LAB_ID"; fi
 
 ensure_storage_layout
 ensure_default_network
@@ -130,7 +135,7 @@ password=${PASSWORD}
 rdp_port=${RDP_PORT}
 CREDS"
 
-OSINFO="$(choose_osinfo)"
+OSINFO="$(choose_osinfo "$OS_RELEASE")"
 as_root virt-install \
   --connect qemu:///system \
   --name "$LAB_ID" \
@@ -148,11 +153,16 @@ as_root virt-install \
   --noautoconsole
 
 [[ "$AUTOSTART" == true ]] && as_root virsh --connect qemu:///system autostart "$LAB_ID"
+VM_INSTANCE_ID="$(as_root virsh --connect qemu:///system domuuid "$LAB_ID")"
+[[ "$VM_INSTANCE_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+  || die "libvirt returned an invalid domain UUID for $LAB_ID."
+as_root bash -c "printf 'vm_instance_id=%s\\n' '$VM_INSTANCE_ID' >> '${LAB_STATE_DIR}/credentials.txt'"
 trap - ERR
 
 cat <<RESULT
 Learner VM created.
 VM: $LAB_ID
+VM instance ID: $VM_INSTANCE_ID
 Username: learner
 RDP password: $PASSWORD
 Credentials: ${LAB_STATE_DIR}/credentials.txt

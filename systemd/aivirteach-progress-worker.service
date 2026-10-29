@@ -1,0 +1,32 @@
+[Unit]
+Description=AIVirTeach durable VM progress observation worker
+After=network-online.target aivirteach-labs-gateway.service
+Wants=network-online.target aivirteach-labs-gateway.service
+
+[Service]
+Type=simple
+User=aivirteach-progress
+Group=aivirteach-progress
+WorkingDirectory=/opt/aivirteach-labs/progress-worker
+EnvironmentFile=/etc/aivirteach-progress.env
+StateDirectory=aivirteach-progress
+StateDirectoryMode=0700
+ExecStart=/opt/aivirteach-labs/progress-worker/start_progress_worker.sh
+Restart=on-failure
+RestartSec=3
+UMask=0077
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

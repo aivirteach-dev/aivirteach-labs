@@ -29,6 +29,10 @@ LIBVIRT_DIR = Path(
 VM_CONTROL_SCRIPT = LIBVIRT_DIR / "scripts" / "vm-control.sh"
 CREATE_VM_SCRIPT = LIBVIRT_DIR / "scripts" / "create-learner-vm.sh"
 LAB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+VM_INSTANCE_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 SENSITIVE_SUBPROCESS_ENV = frozenset(
     {
         "AIVIRTEACH_API_TOKEN",
@@ -94,6 +98,17 @@ class OperationResponse(BaseModel):
     lab_id: str
     operation: str
     message: str
+
+
+class VMListItem(BaseModel):
+    lab_id: str = Field(description="libvirt domain name used by Labs APIs")
+    vm_instance_id: str = Field(description="Immutable libvirt domain UUID")
+    state: str = Field(description="Current libvirt domain state")
+
+
+class VMListResponse(BaseModel):
+    count: int = Field(ge=0)
+    vms: list[VMListItem]
 
 
 class BrowserSessionRequest(BaseModel):
@@ -199,6 +214,10 @@ def _error_status(output: str) -> int:
     lowered = output.lower()
     if "vm not found" in lowered or "domain not found" in lowered:
         return status.HTTP_404_NOT_FOUND
+    # vm-control.sh 的 domain_exists 在 libvirt 本身出错时报这个；必须和 404 区分开，
+    # 否则调用方会把"查不到"当成"VM 不存在"。
+    if "libvirt unavailable" in lowered:
+        return status.HTTP_503_SERVICE_UNAVAILABLE
     if "already exists" in lowered:
         return status.HTTP_409_CONFLICT
     if "timed out" in lowered:
@@ -261,6 +280,37 @@ def _parse_key_value_lines(output: str, separator: str = "=") -> dict[str, str]:
 
 def _parse_dominfo(output: str) -> dict[str, str]:
     return _parse_key_value_lines(output, separator=":")
+
+
+def _parse_vm_list(output: str) -> list[VMListItem]:
+    vms: list[VMListItem] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) != 3:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="VM inventory returned an invalid row.",
+            )
+        lab_id, vm_instance_id, vm_state = (field.strip() for field in fields)
+        if (
+            not lab_id
+            or not VM_INSTANCE_ID_RE.fullmatch(vm_instance_id)
+            or not vm_state
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="VM inventory returned invalid identity data.",
+            )
+        vms.append(
+            VMListItem(
+                lab_id=lab_id,
+                vm_instance_id=vm_instance_id,
+                state=vm_state,
+            )
+        )
+    return vms
 
 
 async def _rdp_ready(ip_address: str, port: int) -> bool:
@@ -407,8 +457,15 @@ async def create_vm(request: CreateVMRequest) -> dict[str, str | int | bool]:
         output = await run_script(argv, timeout_seconds=CREATE_TIMEOUT_SECONDS)
 
     parsed = _parse_key_value_lines(output, separator=":")
+    vm_instance_id = parsed.get("VM instance ID", "")
+    if not VM_INSTANCE_ID_RE.fullmatch(vm_instance_id):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="VM creation did not return a valid instance ID.",
+        )
     return {
         "lab_id": lab_id,
+        "vm_instance_id": vm_instance_id,
         "username": parsed.get("Username", "learner"),
         "rdp_password": parsed.get("RDP password", ""),
         "rdp_port": 3389,
@@ -416,6 +473,20 @@ async def create_vm(request: CreateVMRequest) -> dict[str, str | int | bool]:
         "vcpus": request.vcpus,
         "autostart": request.autostart,
     }
+
+
+@app.get(
+    "/v1/vms",
+    response_model=VMListResponse,
+    dependencies=[Depends(require_api_token)],
+    tags=["vms"],
+    summary="List all virtual machine IDs",
+)
+async def list_vms() -> VMListResponse:
+    """Return every libvirt domain name, immutable UUID, and current state."""
+
+    vms = _parse_vm_list(await run_script([VM_CONTROL_SCRIPT, "list"]))
+    return VMListResponse(count=len(vms), vms=vms)
 
 
 @app.get(

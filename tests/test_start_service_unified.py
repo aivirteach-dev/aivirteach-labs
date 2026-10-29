@@ -41,6 +41,22 @@ class ServiceStartTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("http://127.0.0.1:8765", config)
 
+    def test_progress_worker_has_no_port_or_libvirt_privileges(self) -> None:
+        script = (
+            PROJECT_DIR / "progress-worker" / "start_progress_worker.sh"
+        ).read_text(encoding="utf-8")
+        unit = (
+            PROJECT_DIR / "systemd" / "aivirteach-progress-worker.service"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("AIVIRTEACH_PROGRESS_SERVER_TOKEN", script)
+        self.assertIn("AIVIRTEACH_PROGRESS_DIAGNOSTIC_TOKEN", script)
+        self.assertNotIn("uvicorn", script)
+        self.assertIn("User=aivirteach-progress", unit)
+        self.assertIn("StateDirectory=aivirteach-progress", unit)
+        self.assertNotIn("libvirt-sock", unit)
+        self.assertNotIn("AIVIRTEACH_API_TOKEN", unit)
+
 
 if __name__ == "__main__":
     unittest.main()

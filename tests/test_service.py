@@ -99,6 +99,51 @@ class ServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["State"], "running")
 
+    async def test_list_vms_returns_names_uuids_and_states(self) -> None:
+        output = (
+            "lab-001\t26a6db7e-1ea7-4de2-9ca3-cf58edbab809\trunning\n"
+            "lab-002\t50eb674a-91b2-4f26-93a9-c11efbaa3327\tshut off"
+        )
+        runner = AsyncMock(return_value=output)
+        with patch.object(service, "run_script", runner):
+            response = await self.client.get("/v1/vms", headers=self.auth)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "count": 2,
+                "vms": [
+                    {
+                        "lab_id": "lab-001",
+                        "vm_instance_id": "26a6db7e-1ea7-4de2-9ca3-cf58edbab809",
+                        "state": "running",
+                    },
+                    {
+                        "lab_id": "lab-002",
+                        "vm_instance_id": "50eb674a-91b2-4f26-93a9-c11efbaa3327",
+                        "state": "shut off",
+                    },
+                ],
+            },
+        )
+        runner.assert_awaited_once_with([service.VM_CONTROL_SCRIPT, "list"])
+
+    async def test_list_vms_rejects_missing_token(self) -> None:
+        response = await self.client.get("/v1/vms")
+        self.assertEqual(response.status_code, 401)
+
+    async def test_list_vms_rejects_malformed_inventory(self) -> None:
+        with patch.object(
+            service,
+            "run_script",
+            AsyncMock(return_value="lab-001\tnot-a-uuid\trunning"),
+        ):
+            response = await self.client.get("/v1/vms", headers=self.auth)
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("not-a-uuid", response.text)
+
     async def test_ip_response(self) -> None:
         with patch.object(
             service, "run_script", AsyncMock(return_value="192.168.122.210")
@@ -118,6 +163,7 @@ class ServiceTestCase(unittest.IsolatedAsyncioTestCase):
             return_value=(
                 "Learner VM created.\n"
                 "VM: lab-002\n"
+                "VM instance ID: 26a6db7e-1ea7-4de2-9ca3-cf58edbab809\n"
                 "Username: learner\n"
                 "RDP password: generated-secret"
             )
@@ -131,6 +177,10 @@ class ServiceTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["rdp_password"], "generated-secret")
+        self.assertEqual(
+            response.json()["vm_instance_id"],
+            "26a6db7e-1ea7-4de2-9ca3-cf58edbab809",
+        )
         argv = runner.await_args.args[0]
         self.assertEqual(argv[0], service.CREATE_VM_SCRIPT)
         self.assertEqual(
@@ -148,6 +198,25 @@ class ServiceTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 422)
         runner.assert_not_awaited()
+
+    async def test_create_rejects_a_missing_vm_instance_id(self) -> None:
+        runner = AsyncMock(
+            return_value=(
+                "Learner VM created.\n"
+                "VM: lab-002\n"
+                "Username: learner\n"
+                "RDP password: generated-secret"
+            )
+        )
+        with patch.object(service, "run_script", runner):
+            response = await self.client.post(
+                "/v1/vms",
+                headers=self.auth,
+                json={"lab_id": "lab-002"},
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("generated-secret", response.text)
 
     async def test_delete_requires_explicit_confirmation(self) -> None:
         runner = AsyncMock()
@@ -378,6 +447,21 @@ class ServiceTestCase(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 503)
         runner.assert_not_awaited()
+
+
+class ErrorStatusTestCase(unittest.TestCase):
+    """调用方（aivirteach-server）只在 404 + "VM not found" 时认定 VM 不存在，
+    所以 libvirt 本身不可用必须映射成 503，不能落进 404。"""
+
+    def test_vm_not_found_is_404(self) -> None:
+        self.assertEqual(service._error_status("ERROR: VM not found"), 404)
+
+    def test_libvirt_unavailable_is_503(self) -> None:
+        output = (
+            "ERROR: libvirt unavailable while checking 'lab-1': "
+            "error: failed to connect to the hypervisor"
+        )
+        self.assertEqual(service._error_status(output), 503)
 
 
 if __name__ == "__main__":

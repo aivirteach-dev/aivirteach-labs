@@ -1,0 +1,168 @@
+services:
+
+  vm-manager:
+    build:
+      context: .
+      dockerfile: vm-manager/guacamole/vm-manager.Dockerfile
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    # create-learner-vm.sh assigns generated disks to the host libvirt-qemu
+    # account, then tightens their modes. Keep the exception narrower than
+    # running the container as fully privileged.
+    cap_add:
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      AIVIRTEACH_SESSION_TOKEN: "${AIVIRTEACH_SESSION_TOKEN:?Set AIVIRTEACH_SESSION_TOKEN}"
+      AIVIRTEACH_GUACAMOLE_JSON_SECRET: "${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}"
+      AIVIRTEACH_RDP_ALLOWED_CIDRS: "${AIVIRTEACH_RDP_ALLOWED_CIDRS:-192.168.122.0/24}"
+      AIVIRTEACH_BROWSER_SESSION_TTL: "${AIVIRTEACH_BROWSER_SESSION_TTL:-60}"
+      AIVIRTEACH_API_TOKEN: "${AIVIRTEACH_API_TOKEN:?Set AIVIRTEACH_API_TOKEN}"
+      AIVIRTEACH_VM_CORS_ORIGINS: "${AIVIRTEACH_VM_CORS_ORIGINS:-http://127.0.0.1:8780,http://localhost:8780}"
+    ports:
+      - "0.0.0.0:8760:8760"
+    volumes:
+      # virsh/virt-install talk to the host qemu:///system daemon. The host
+      # identity files let chown resolve the same libvirt-qemu/kvm/libvirt IDs.
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      - /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock
+      # Keep identical absolute paths: host libvirtd receives these paths from
+      # virt-install and must be able to open the generated overlay/seed files.
+      - /var/lib/libvirt/images/aivirteach:/var/lib/libvirt/images/aivirteach:rw
+      - /var/lib/aivirteach-labs:/var/lib/aivirteach-labs:rw
+
+  diagnostic-service:
+    build:
+      context: .
+      dockerfile: diagnostic-gateway/diagnostic-service.Dockerfile
+    restart: unless-stopped
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 128
+    environment:
+      AIVIRTEACH_DIAGNOSTIC_HOST: "0.0.0.0"
+      AIVIRTEACH_DIAGNOSTIC_PORT: "8765"
+      AIVIRTEACH_DIAGNOSTIC_TOKEN: "${AIVIRTEACH_DIAGNOSTIC_TOKEN:?Set AIVIRTEACH_DIAGNOSTIC_TOKEN}"
+      AIVIRTEACH_PROGRESS_DIAGNOSTIC_TOKEN: "${AIVIRTEACH_PROGRESS_DIAGNOSTIC_TOKEN:?Set AIVIRTEACH_PROGRESS_DIAGNOSTIC_TOKEN}"
+      AIVIRTEACH_DIAGNOSTIC_CORS_ORIGINS: "${AIVIRTEACH_DIAGNOSTIC_CORS_ORIGINS:-http://127.0.0.1:8780,http://localhost:8780}"
+      AIVIRTEACH_GUEST_ALLOWED_ROOTS: "${AIVIRTEACH_GUEST_ALLOWED_ROOTS:-/home/learner/course}"
+      AIVIRTEACH_DIAGNOSTIC_COMMAND_TIMEOUT: "${AIVIRTEACH_DIAGNOSTIC_COMMAND_TIMEOUT:-8}"
+      AIVIRTEACH_DIAGNOSTIC_MAX_OUTPUT_BYTES: "${AIVIRTEACH_DIAGNOSTIC_MAX_OUTPUT_BYTES:-65536}"
+    ports:
+      - "${AIVIRTEACH_HOST_IP:-127.0.0.1}:8765:8765"
+    volumes:
+      # The API exposes fixed read-only tools, but the libvirt socket itself is
+      # privileged. Keep port 8765 private and never mount the Docker socket.
+      - /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock
+
+  agent-service:
+    build:
+      context: .
+      dockerfile: agent-service/agent-service.Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      diagnostic-service:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    pids_limit: 128
+    stop_grace_period: 45s
+    environment:
+      AIVIRTEACH_AGENT_HOST: "0.0.0.0"
+      AIVIRTEACH_AGENT_PORT: "8770"
+      AIVIRTEACH_AGENT_TOKEN: "${AIVIRTEACH_AGENT_TOKEN:?Set AIVIRTEACH_AGENT_TOKEN}"
+      AIVIRTEACH_AGENT_CORS_ORIGINS: "${AIVIRTEACH_AGENT_CORS_ORIGINS:-http://127.0.0.1:8780,http://localhost:8780}"
+      AIVIRTEACH_COURSE_DIR: "/app/.cache/course/AI Daily Briefing/processed"
+      AIVIRTEACH_GATEWAY_URL: "http://diagnostic-service:8765"
+      AIVIRTEACH_DIAGNOSTIC_TOKEN: "${AIVIRTEACH_DIAGNOSTIC_TOKEN:?Set AIVIRTEACH_DIAGNOSTIC_TOKEN}"
+      AIVIRTEACH_MODEL_PROVIDER: "${AIVIRTEACH_MODEL_PROVIDER:-fake}"
+      AIVIRTEACH_MODEL_BASE_URL: "${AIVIRTEACH_MODEL_BASE_URL:-}"
+      AIVIRTEACH_MODEL_API_KEY: "${AIVIRTEACH_MODEL_API_KEY:-}"
+      AIVIRTEACH_MODEL_NAME: "${AIVIRTEACH_MODEL_NAME:-}"
+      AIVIRTEACH_MODEL_THINKING: "${AIVIRTEACH_MODEL_THINKING:-}"
+      AIVIRTEACH_AGENT_TOTAL_TIMEOUT: "${AIVIRTEACH_AGENT_TOTAL_TIMEOUT:-40}"
+      AIVIRTEACH_MODEL_TIMEOUT: "${AIVIRTEACH_MODEL_TIMEOUT:-15}"
+      AIVIRTEACH_TOOL_TIMEOUT: "${AIVIRTEACH_TOOL_TIMEOUT:-8}"
+      AIVIRTEACH_MAX_REASONING_TURNS: "${AIVIRTEACH_MAX_REASONING_TURNS:-4}"
+      AIVIRTEACH_MAX_TOOL_CALLS: "${AIVIRTEACH_MAX_TOOL_CALLS:-6}"
+      AIVIRTEACH_MAX_TOOL_OUTPUT_CHARS: "${AIVIRTEACH_MAX_TOOL_OUTPUT_CHARS:-32768}"
+      AIVIRTEACH_MAX_CONCURRENT_REQUESTS: "${AIVIRTEACH_MAX_CONCURRENT_REQUESTS:-4}"
+    ports:
+      - "0.0.0.0:8770:8770"
+    volumes:
+      # Process raw course content on the host, then mount its cache read-only.
+      # Override this source path with AIVIRTEACH_COURSE_CACHE_HOST if needed.
+      - "${AIVIRTEACH_COURSE_CACHE_HOST:-./agent-service/.cache/course}:/app/.cache/course:ro"
+
+  unified-docs:
+    build:
+      context: .
+      dockerfile: docs-service/unified-docs.Dockerfile
+    restart: unless-stopped
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 128
+    environment:
+      AIVIRTEACH_DOCS_HOST: "0.0.0.0"
+      AIVIRTEACH_DOCS_PORT: "8780"
+      AIVIRTEACH_DOCS_FETCH_TIMEOUT: "${AIVIRTEACH_DOCS_FETCH_TIMEOUT:-3}"
+      # Internal Compose addresses are used only to fetch OpenAPI documents.
+      AIVIRTEACH_VM_OPENAPI_URL: "${AIVIRTEACH_VM_OPENAPI_URL:-http://vm-manager:8760/openapi.json}"
+      AIVIRTEACH_DIAGNOSTIC_OPENAPI_URL: "${AIVIRTEACH_DIAGNOSTIC_OPENAPI_URL:-http://diagnostic-service:8765/openapi.json}"
+      AIVIRTEACH_AGENT_OPENAPI_URL: "${AIVIRTEACH_AGENT_OPENAPI_URL:-http://agent-service:8770/openapi.json}"
+      # Swagger sends browser requests to these externally reachable URLs.
+      AIVIRTEACH_VM_DOCS_URL: "${AIVIRTEACH_VM_DOCS_URL:-http://127.0.0.1:8760}"
+      AIVIRTEACH_DIAGNOSTIC_DOCS_URL: "${AIVIRTEACH_DIAGNOSTIC_DOCS_URL:-http://127.0.0.1:8765}"
+      AIVIRTEACH_AGENT_DOCS_URL: "${AIVIRTEACH_AGENT_DOCS_URL:-http://127.0.0.1:8770}"
+    ports:
+      - "0.0.0.0:8780:8780"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  guacd:
+    image: "guacamole/guacd:${GUACAMOLE_VERSION:-1.6.0}"
+    restart: unless-stopped
+    networks:
+      - guacamole
+
+  guacamole:
+    image: "guacamole/guacamole:${GUACAMOLE_VERSION:-1.6.0}"
+    restart: unless-stopped
+    depends_on:
+      - guacd
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: "4822"
+      JSON_ENABLED: "true"
+      JSON_SECRET_KEY: "${GUACAMOLE_JSON_SECRET:?Set GUACAMOLE_JSON_SECRET}"
+      REMOTE_IP_VALVE_ENABLED: "true"
+      API_SESSION_TIMEOUT: "30"
+    ports:
+      - "0.0.0.0:8080:8080"
+    networks:
+      - guacamole
+
+networks:
+  guacamole:

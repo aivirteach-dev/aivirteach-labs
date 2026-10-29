@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -113,7 +114,7 @@ class CourseRepositoryTests(unittest.TestCase):
     def test_converter_creates_valid_retrieval_document(self) -> None:
         markdown = """# Example Course
 
-# Overview
+# Agent Runbook Scope
 
 An example course.
 
@@ -137,7 +138,7 @@ services:
 
 ## S1 — Docker Ready
 
-**Expected result**
+**Expected result by node**
 
 - Docker is active.
 
@@ -155,10 +156,16 @@ services:
             course_path, index_path = process(raw, output)
             payload = json.loads(course_path.read_text(encoding="utf-8"))
             stored = StoredCourse.model_validate(payload)
+            course_mode = stat.S_IMODE(course_path.stat().st_mode)
+            index_mode = stat.S_IMODE(index_path.stat().st_mode)
 
         self.assertEqual(index_path.name, "index.json")
+        self.assertEqual(course_mode, 0o644)
+        self.assertEqual(index_mode, 0o644)
         self.assertEqual(len(stored.lessons), 1)
+        self.assertEqual(stored.course.summary, "An example course.")
         self.assertEqual(stored.lessons[0].checkpoint_ids, ["S1"])
+        self.assertEqual(stored.lessons[0].context.success_criteria, ["Docker is active."])
         self.assertIn("  app:", stored.lessons[0].relevant_excerpts[0].content)
 
 

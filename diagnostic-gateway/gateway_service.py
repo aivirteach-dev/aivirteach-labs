@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 
 from fastapi import FastAPI, HTTPException, status
@@ -20,7 +21,7 @@ def _cors_origins() -> list[str]:
 
 app = FastAPI(
     title="AIVirTeach Diagnostic Gateway",
-    version="1.1.0",
+    version="1.3.0",
     description=(
         "A privileged but read-only diagnostic API. It exposes only fixed "
         "diagnostic tools and does not expose VM lifecycle operations."
@@ -44,9 +45,16 @@ async def health() -> dict[str, str]:
 
 @app.get("/ready", tags=["service"])
 async def ready() -> dict[str, str]:
-    if not os.getenv("AIVIRTEACH_DIAGNOSTIC_TOKEN", ""):
+    diagnostic_token = os.getenv("AIVIRTEACH_DIAGNOSTIC_TOKEN", "")
+    progress_token = os.getenv("AIVIRTEACH_PROGRESS_DIAGNOSTIC_TOKEN", "")
+    if not diagnostic_token:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="AIVIRTEACH_DIAGNOSTIC_TOKEN is not configured.",
+        )
+    if progress_token and hmac.compare_digest(progress_token, diagnostic_token):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Diagnostic token scopes must use different values.",
         )
     return {"status": "ready", "service": "diagnostic-gateway"}

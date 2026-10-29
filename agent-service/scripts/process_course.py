@@ -302,6 +302,11 @@ def build_processed_course(
         raise ValueError(f"No numbered lesson headings found in {markdown_path}")
 
     overview = _global_section(lines, "# Overview", "# Agent Operating Protocol")
+    if not overview:
+        # The reviewed course-image runbook uses this heading for its overview.
+        overview = _global_section(
+            lines, "# Agent Runbook Scope", "# Agent Operating Protocol"
+        )
     protocol = _global_section(
         lines, "# Agent Operating Protocol", "# 1 Configure the Runtime Environment"
     )
@@ -327,7 +332,15 @@ def build_processed_course(
         success_criteria: list[str] = []
         failures: list[dict[str, Any]] = []
         for checkpoint, blocks in zip(checkpoint_records, checkpoint_blocks, strict=True):
-            success_criteria.extend(_bullet_items(blocks.get("expected result", "")))
+            expected_result = next(
+                (
+                    content
+                    for name, content in blocks.items()
+                    if name.startswith("expected result")
+                ),
+                "",
+            )
+            success_criteria.extend(_bullet_items(expected_result))
             failures.extend(_common_failures(checkpoint.key, blocks.get("common failures", "")))
         success_criteria = list(dict.fromkeys(success_criteria))[:20]
         failures = list({item["code"]: item for item in failures}.values())[:12]
@@ -412,6 +425,9 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
         temporary = Path(handle.name)
+    # Compose mounts this cache read-only and Agent runs as an unprivileged UID.
+    # Course retrieval JSON contains no credentials and must remain readable.
+    temporary.chmod(0o644)
     temporary.replace(path)
 
 

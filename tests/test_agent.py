@@ -9,11 +9,14 @@ import httpx
 from aivirteach_agent.app import build_provider, create_app
 from aivirteach_agent.config import Settings
 from aivirteach_agent.models import DiagnoseRequest, ToolName
-from aivirteach_agent.orchestrator import AgentOrchestrator, _parse_draft
+from aivirteach_agent.orchestrator import AgentOrchestrator, _parse_assessment
+from aivirteach_agent.prompts import SYSTEM_PROMPT
 from aivirteach_agent.providers import (
     FakeProvider,
     OpenAICompatibleProvider,
     ProviderMessage,
+    ProviderStreamDone,
+    ProviderTextDelta,
     ProviderTool,
     ProviderToolCall,
     ProviderTurn,
@@ -91,6 +94,12 @@ class FakeGateway:
         return None
 
 
+class ProgressSnapshotPromptTests(unittest.TestCase):
+    def test_agent_uses_server_snapshot_instead_of_rechecking_completion(self) -> None:
+        self.assertIn("learner_state.vm_progress", SYSTEM_PROMPT)
+        self.assertIn("instead of calling tools merely to re-check course completion", SYSTEM_PROMPT)
+
+
 class AgentApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.cors_environment = patch.dict(
@@ -122,6 +131,12 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/v1/agent/diagnose", json=request_payload())
         self.assertEqual(response.status_code, 401)
 
+        stream_response = await self.client.post(
+            "/v1/agent/diagnose/stream",
+            json=request_payload(),
+        )
+        self.assertEqual(stream_response.status_code, 401)
+
     async def test_swagger_origin_is_allowed_by_cors(self) -> None:
         response = await self.client.options(
             "/v1/agent/diagnose",
@@ -147,6 +162,12 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
             for parameter in operation.get("parameters", [])
         }
         self.assertNotIn("authorization", parameter_names)
+        stream_operation = schema["paths"]["/v1/agent/diagnose/stream"]["post"]
+        self.assertEqual(stream_operation["security"], [{"AgentBearer": []}])
+        self.assertIn(
+            "text/event-stream",
+            stream_operation["responses"]["200"]["content"],
+        )
 
     async def test_fake_provider_smoke_response(self) -> None:
         response = await self.client.post(
@@ -158,11 +179,63 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["status"], "completed")
         self.assertIn("FAKE_MODEL_PROVIDER", response.json()["limitations"])
 
+    async def test_sse_stream_emits_progress_and_validated_result(self) -> None:
+        response = await self.client.post(
+            "/v1/agent/diagnose/stream",
+            headers={"Authorization": "Bearer agent-token"},
+            json=request_payload(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            response.headers["content-type"].startswith("text/event-stream")
+        )
+        self.assertEqual(response.headers["cache-control"], "no-cache, no-transform")
+        self.assertEqual(response.headers["x-accel-buffering"], "no")
+        events = _parse_sse(response.text)
+        event_names = [event for event, _ in events]
+        self.assertEqual(
+            event_names[:8],
+            [
+                "accepted",
+                "started",
+                "context_ready",
+                "reasoning_started",
+                "reasoning_finished",
+                "assessment_validating",
+                "assessment_validated",
+                "answer_started",
+            ],
+        )
+        self.assertEqual(event_names[-3:], ["answer_finished", "result", "done"])
+        self.assertGreater(event_names.count("assistant_delta"), 1)
+        sequences = [payload["sequence"] for _, payload in events]
+        self.assertEqual(sequences, list(range(1, len(events) + 1)))
+        self.assertTrue(
+            all(
+                payload["schema_version"] == 1
+                and payload["request_id"] == request_payload()["request_id"]
+                for _, payload in events
+            )
+        )
+        deltas = [
+            payload["delta"]
+            for event, payload in events
+            if event == "assistant_delta"
+        ]
+        self.assertTrue(all(isinstance(delta, str) and delta for delta in deltas))
+        self.assertNotIn('{"answer"', "".join(deltas))
+        result = next(payload for event, payload in events if event == "result")
+        self.assertEqual(result["response"]["status"], "completed")
+        self.assertIn("FAKE_MODEL_PROVIDER", result["response"]["limitations"])
+        self.assertEqual("".join(deltas), result["response"]["answer"])
+        done = next(payload for event, payload in events if event == "done")
+        self.assertEqual(done["status"], result["response"]["status"])
+
 
 class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_authorized_tool_call_collects_real_evidence(self) -> None:
         final = {
-            "answer": "Docker 服务未运行。",
             "diagnosis": {
                 "summary": "docker.service is inactive",
                 "probable_causes": ["Docker 未启动"],
@@ -196,14 +269,27 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         orchestrator = AgentOrchestrator(
             settings=settings(), provider=provider, gateway=gateway
         )
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        async def capture(event: str, data: dict[str, Any]) -> None:
+            events.append((event, data))
+
         response = await orchestrator.diagnose(
-            DiagnoseRequest.model_validate(request_payload())
+            DiagnoseRequest.model_validate(request_payload()),
+            on_event=capture,
         )
 
         self.assertEqual(response.status, "completed")
         self.assertEqual(response.evidence[0].id, "obs-001")
         self.assertEqual(gateway.calls[0][1], ToolName.GET_GUEST_SERVICE_STATUS)
         self.assertEqual(response.tool_trace[0].status, "ok")
+        self.assertIn(
+            ("tool_started", {"tool": "get_guest_service_status"}),
+            events,
+        )
+        finished = next(data for event, data in events if event == "tool_finished")
+        self.assertEqual(finished["status"], "ok")
+        self.assertEqual(finished["observation_id"], "obs-001")
 
     async def test_course_scope_denies_resource_before_gateway(self) -> None:
         payload = request_payload()
@@ -222,7 +308,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 ProviderTurn(
                     text=json.dumps(
                         {
-                            "answer": "没有足够证据。",
                             "diagnosis": {"summary": "未知", "confidence": "low"},
                             "course_alignment": {"expected": [], "observed": []},
                             "evidence_ids": [],
@@ -244,7 +329,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_tool_call_uses_request_cache(self) -> None:
         final = {
-            "answer": "已收集证据。",
             "diagnosis": {"summary": "状态已知", "confidence": "medium"},
             "course_alignment": {"expected": [], "observed": []},
             "evidence_ids": ["obs-001"],
@@ -299,6 +383,83 @@ class PolicyTests(unittest.TestCase):
 
 
 class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_complete_yields_only_visible_text_deltas(self) -> None:
+        captured: dict[str, Any] = {}
+        chunks = [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "content": "Docker ",
+                            "reasoning_content": "private reasoning",
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {"content": "服务未运行。"},
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {"choices": [], "usage": {"total_tokens": 12}},
+            {
+                "choices": [
+                    {
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        ]
+        body = "".join(
+            f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            for chunk in chunks
+        ) + "data: [DONE]\n\n"
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                content=body.encode(),
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            base_url="https://provider.example/v1",
+            api_key="secret",
+            model="test-model",
+            timeout_seconds=2,
+            thinking="disabled",
+            client=client,
+        )
+        try:
+            events = [
+                event
+                async for event in provider.stream_complete(
+                    messages=(ProviderMessage(role="user", content="hello"),),
+                    tools=(),
+                )
+            ]
+        finally:
+            await client.aclose()
+
+        deltas = [
+            event.text for event in events if isinstance(event, ProviderTextDelta)
+        ]
+        done = next(event for event in events if isinstance(event, ProviderStreamDone))
+        self.assertTrue(captured["stream"])
+        self.assertEqual(captured["thinking"], {"type": "disabled"})
+        self.assertNotIn("tools", captured)
+        self.assertNotIn("tool_choice", captured)
+        self.assertEqual(deltas, ["Docker ", "服务未运行。"])
+        self.assertNotIn("private reasoning", "".join(deltas))
+        self.assertEqual(done.finish_reason, "stop")
+
     async def test_configured_thinking_mode_is_sent_to_provider(self) -> None:
         captured: dict[str, Any] = {}
 
@@ -370,12 +531,11 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ModelOutputParsingTests(unittest.TestCase):
-    def test_extracts_valid_answer_after_provider_preamble(self) -> None:
-        draft = _parse_draft(
+    def test_extracts_valid_assessment_after_provider_preamble(self) -> None:
+        draft = _parse_assessment(
             "I have enough evidence.\n\n"
             + json.dumps(
                 {
-                    "answer": "虚拟机运行正常。",
                     "diagnosis": {
                         "summary": "状态正常",
                         "probable_causes": [],
@@ -390,8 +550,22 @@ class ModelOutputParsingTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(draft.answer, "虚拟机运行正常。")
+        self.assertEqual(draft.diagnosis.summary, "状态正常")
         self.assertEqual(draft.limitations, ["未检查应用端口。"])
+
+
+def _parse_sse(value: str) -> list[tuple[str, dict[str, Any]]]:
+    events: list[tuple[str, dict[str, Any]]] = []
+    for block in value.strip().split("\n\n"):
+        if not block or block.startswith(":"):
+            continue
+        fields = dict(
+            line.split(": ", 1)
+            for line in block.splitlines()
+            if ": " in line
+        )
+        events.append((fields["event"], json.loads(fields["data"])))
+    return events
 
 
 if __name__ == "__main__":

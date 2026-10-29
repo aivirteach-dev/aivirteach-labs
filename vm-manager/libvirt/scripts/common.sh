@@ -37,6 +37,28 @@ as_root() {
   fi
 }
 
+# 所有 virsh 调用都走这里：固定 LC_ALL=C（sudo 会重置环境，所以放进命令里），
+# 否则非英文 locale 会翻译 dominfo 的 "State"/"shut off"，也会让下面的错误匹配失效。
+virsh_c() {
+  as_root env LC_ALL=C virsh --connect qemu:///system "$@"
+}
+
+# domain 是否存在，三种结果：
+#   返回 0 —— 存在；
+#   返回 1 —— libvirt 明确回答"没有这个 domain"；
+#   其它任何失败（libvirtd 挂了、socket 权限、sudo -n 要密码……）直接 die "libvirt unavailable"。
+# 调用方会把"不存在"当成可以删文件、可以放弃管理的依据，所以绝不能把"查不到"说成"不存在"。
+domain_exists() {
+  local name="$1" output
+  if output="$(virsh_c domstate "$name" 2>&1)"; then
+    return 0
+  fi
+  if grep -qiE "failed to get domain|domain not found" <<<"$output"; then
+    return 1
+  fi
+  die "libvirt unavailable while checking '$name': ${output}"
+}
+
 validate_lab_id() {
   local lab_id="$1"
   [[ "$lab_id" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$ ]] \
@@ -44,9 +66,37 @@ validate_lab_id() {
 }
 
 choose_osinfo() {
+  local release="${1:-}"
+  local preferred=""
   local candidate
+  local osinfo_list
+
+  case "$release" in
+    24.04) preferred="ubuntu24.04" ;;
+    22.04) preferred="ubuntu22.04" ;;
+    20.04) preferred="ubuntu20.04" ;;
+  esac
+  osinfo_list="$(virt-install --osinfo list 2>/dev/null || true)"
+
+  if [[ -n "$preferred" ]] \
+      && awk -v candidate="$preferred" '
+        {for (i=1; i<=NF; i++) {gsub(/,$/, "", $i); if ($i == candidate) found=1}}
+        END {exit !found}
+      ' \
+        <<<"$osinfo_list"; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+  if [[ -n "$preferred" ]]; then
+    printf 'generic\n'
+    return 0
+  fi
   for candidate in ubuntu24.04 ubuntu22.04 ubuntu20.04 generic; do
-    if virt-install --osinfo list 2>/dev/null | awk '{print $1}' | grep -Fxq "$candidate"; then
+    if awk -v candidate="$candidate" '
+        {for (i=1; i<=NF; i++) {gsub(/,$/, "", $i); if ($i == candidate) found=1}}
+        END {exit !found}
+      ' \
+        <<<"$osinfo_list"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -55,14 +105,25 @@ choose_osinfo() {
 }
 
 ensure_default_network() {
-  local network_info
-  if ! as_root virsh --connect qemu:///system net-info "$LIBVIRT_NETWORK" >/dev/null 2>&1; then
-    die "Libvirt network '$LIBVIRT_NETWORK' does not exist. Run scripts/install-host.sh first."
+  local network_info=""
+  if ! network_info="$(
+    as_root virsh --connect qemu:///system net-info "$LIBVIRT_NETWORK" 2>&1
+  )"; then
+    if grep -qiE \
+        'network not found|no network with matching name' \
+        <<<"$network_info"; then
+      die "Libvirt network '$LIBVIRT_NETWORK' does not exist. Run scripts/install-host.sh first."
+    fi
+
+    # A socket permission error, an unavailable daemon, or failed non-interactive
+    # sudo is not the same thing as a missing network. Preserve the real virsh/sudo
+    # error so callers know whether to use sudo, re-login, or restart libvirt.
+    network_info="${network_info//$'\n'/; }"
+    die "Unable to query libvirt network '$LIBVIRT_NETWORK': ${network_info:-unknown error}. Run this script with sudo, or verify libvirtd and /var/run/libvirt/libvirt-sock access."
   fi
   # Do not use `virsh ... | grep -q` under `set -o pipefail`: grep may close
   # the pipe after the match and make virsh report SIGPIPE, which incorrectly
   # sends an already-active network through `net-start`.
-  network_info="$(as_root virsh --connect qemu:///system net-info "$LIBVIRT_NETWORK")"
   if ! grep -q 'Active:.*yes' <<<"$network_info"; then
     as_root virsh --connect qemu:///system net-start "$LIBVIRT_NETWORK" >/dev/null
   fi
