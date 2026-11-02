@@ -41,3 +41,6 @@ Thumbs.db
 # 私有教材不提交；来源元数据与读取代码仍保留。
 /inputs/
 /materials/
+
+# 隔离测试身份、令牌和持久库仅在本机。
+/.isolated/

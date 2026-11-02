@@ -1,6 +1,6 @@
 """独立Agent v1本地传输：宿主鉴权绑定、短提交与有界轮询。
 
-只监听回环地址；生产TLS、登录、平台JWT验证须由部署宿主接入。
+默认监听回环；隔离测试宿主可显式绑定容器地址，生产TLS/平台JWT仍须接入。
 认证解析器返回TrustedBinding，绝不信任学生正文中的身份或文件路径。
 """
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
@@ -18,8 +18,11 @@ def _object(pairs):
     return result
 
 
-def create_agent_server(service,resolve_token,port=8792):
+def create_agent_server(service,resolve_token,port=8792,*,bind_host='127.0.0.1',health=None):
     """resolve_token由可信宿主注入；失败关闭，异常文本和令牌不入响应。"""
+    # 容器内监听由宿主显式开启；默认入口仍为loopback，不能由学生请求改变。
+    if bind_host not in ('127.0.0.1','0.0.0.0') or (bind_host!='127.0.0.1' and service.settings.profile!='isolated_test'):
+        raise ValueError('isolated_bind_required')
     budget=HttpBudget(service.settings.http_budget)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args):pass
@@ -65,6 +68,13 @@ def create_agent_server(service,resolve_token,port=8792):
             except (ValueError,RecursionError):raise ServiceError('invalid_json',400) from None
 
         def route(self):
+            if health is not None and self.command=='GET' and self.path in ('/health','/ready'):
+                if self.headers.get_all('Host') not in ([f'127.0.0.1:{self.server.server_port}'],[f'localhost:{self.server.server_port}']) or self.headers.get('Origin'):
+                    raise ServiceError('host_denied',403)
+                # 回调只能投影启动时已核对的本地状态，不查库、不探测模型或执行工具。
+                state=health();ready=state.get('ready') is True
+                if self.path=='/health':return 200,{'status':'alive','scope':'isolated_test'}
+                return (200 if ready else 503),{'status':'ready' if ready else 'paused','scope':'isolated_test'}
             binding=self.binding()
             if len(self.path)>512:raise ServiceError('invalid_query',400)
             url=urlsplit(self.path);params=parse_qs(url.query,keep_blank_values=True)
@@ -122,4 +132,4 @@ def create_agent_server(service,resolve_token,port=8792):
             finally:
                 if category is not None:category.release()
                 self.slots.release()
-    return Server(('127.0.0.1',port),Handler)
+    return Server((bind_host,port),Handler)

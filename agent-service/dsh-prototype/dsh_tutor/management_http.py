@@ -1,4 +1,4 @@
-"""本地管理员只读HTTP适配；只监听loopback，由Next服务端持令牌访问。"""
+"""管理员只读HTTP适配；默认loopback，隔离容器绑定须宿主显式授权。"""
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from urllib.parse import urlsplit,parse_qs
 from collections import deque
@@ -9,8 +9,13 @@ import json
 from .management import ManagementError
 
 
-def create_management_server(view,token,port=8788):
+def create_management_server(view,token,port=8788,*,bind_host='127.0.0.1',isolated_test=False,allowed_hosts=()):
     if not isinstance(token,str) or len(token)<32:raise ValueError('weak_token')
+    if bind_host not in ('127.0.0.1','0.0.0.0') or ((bind_host!='127.0.0.1' or allowed_hosts) and not isolated_test):
+        raise ValueError('isolated_bind_required')
+    hosts=(f'127.0.0.1:{port}',f'localhost:{port}')+tuple(allowed_hosts)
+    if any(not isinstance(x,str) or len(x)>128 or any(c in x for c in '/@?#\r\n') for x in hosts):
+        raise ValueError('invalid_management_host')
     times=deque(maxlen=40);lock=threading.Lock()
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args):pass  # 不记录Authorization、URL查询或原异常。
@@ -20,9 +25,11 @@ def create_management_server(view,token,port=8788):
             self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store')
             self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(body)
         def do_GET(self):
-            if self.headers.get('Host') not in (f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}'):
+            actual_hosts=(f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}')+tuple(allowed_hosts)
+            if self.headers.get_all('Host') not in ([h] for h in actual_hosts):
                 return self.send(403,{'error':'host_denied'})
-            if self.headers.get('Origin') or not secrets.compare_digest(self.headers.get('Authorization',''),'Bearer '+token):
+            auth=self.headers.get_all('Authorization') or []
+            if self.headers.get('Origin') or len(auth)!=1 or not secrets.compare_digest(auth[0],'Bearer '+token):
                 return self.send(401,{'error':'unauthorized'})
             with lock:
                 at=time.monotonic()
@@ -64,4 +71,4 @@ def create_management_server(view,token,port=8788):
             request.settimeout(3)
             try:super().process_request_thread(request,address)
             finally:self.slots.release()
-    return Server(('127.0.0.1',port),Handler)
+    return Server((bind_host,port),Handler)

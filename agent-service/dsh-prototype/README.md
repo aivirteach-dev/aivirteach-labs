@@ -2,6 +2,8 @@
 
 本模块位于 Labs 的 `agent-service/dsh-prototype/`，用于验证 DeepSeek Harness、受控 MCP、课程问答、学习记忆、资源调度、异步交付和只读管理界面。它没有替换上级目录的现有 Agent，不修改仓库根 Compose，也不会因为下载代码而自动启动。
 
+第二阶段新增独立容器环境，详见 [隔离环境说明](docs/isolated-environment.md)：仅固定假提供方和虚构身份，默认暂停，显式准备/启动/放行，不接真实平台或VM。
+
 2026-11-02 从独立原型的已验证候选包整理。业务模块保留；真实教材原件和完整提取资料不公开。公开源码、私有资料和实际模型验收分别记录。历史文档中的机器路径、阶段数量和模型结果属于原开发环境，不表示本分支已接通真实平台。
 
 ## 从干净目录准备
@@ -37,7 +39,7 @@ npm run build
 | `GET /v1/tutor/operations/{operation_id}?after=0` | 有界进度、状态和已保存结果 |
 | `POST /v1/tutor/operations/{operation_id}/cancel` | 正文 `{}`；请求取消，远端未知不伪报停止 |
 
-HTTP 工厂仅监听本机回环；这是后端宿主接口，不是直接暴露给浏览器的学生登录接口。没有配置真实鉴权/数据绑定的可直接部署入口。`succeeded` 只确认 Agent 聊天及操作记录保存，平台保存仍未确认。用量未知是 null，不是 0。见 `docs/integration-stage3.md`。
+HTTP 工厂仅监听本机回环；这是后端宿主接口，不是直接暴露给浏览器的学生登录接口。现有隔离宿主只绑定固定虚构身份，不是带正式平台鉴权的部署入口。`succeeded` 只确认 Agent 聊天及操作记录保存，平台保存仍未确认。用量未知是 null，不是 0。见 `docs/integration-stage3.md`。
 
 `platform_adapter.py` 只实现固定版本的有限课程问答转换：非空 history/learner_state/diagnostic_scope 拒绝，未映射诊断工具证据拒绝，有限平台响应必须 partial。它不等于完整兼容现有同步 diagnose/SSE 接口。真实 Server 请求、可信身份、完整证据和平台最终保存必须另验收，不新建第二套模型循环。
 
@@ -65,7 +67,7 @@ HTTP 工厂仅监听本机回环；这是后端宿主接口，不是直接暴露
 - 不合并 main、不覆盖原 Agent、不启动根 Compose，不在已有服务器目录 pull/checkout/reset/clean/stash。
 - 服务器单独 clone 并固定 commit；模型、端口、数据库和测试 VM 必须显式配置，私有资料不进 Git。
 - 调度与模型所有权当前是单进程；不得增加 worker/副本并声称全局并发仍受限。
-- Docker、常驻启动装配、真实平台认证/Gateway、远端取消、多人容量和正式发布均待后续阶段。停止本地进程不能证明远端模型已停止。
+- 已有隔离容器与常驻测试装配；真实平台认证/Gateway、真实模型、远端取消、多人容量和正式发布均待后续阶段。停止本地进程不能证明远端模型已停止。
 - 本模块的源码版本由 Git 提交确定；升级在一个开发工作副本进行，服务器只运行已记录提交。回退优先 revert 或切回明确测试版本，不影响原运行目录。
 
 目录：`dsh_tutor` 为复用业务模块；`sandbox` 为模拟工具、演示和测试；`tools` 为准备/检查/维护工具；`management_frontend` 为 Next/React/TypeScript 界面；`docs` 为契约与模块说明。验证清单见 `docs/public-release.md`。
