@@ -1,0 +1,8 @@
+{
+  "course_id": "demo-n8n",
+  "version": "demo-v1",
+  "lesson_id": "start-n8n",
+  "title": "模拟课时：启动 n8n",
+  "goals": ["启动 n8n 容器", "打开 n8n 网页"],
+  "instructions": ["按本课操作说明启动 n8n 容器。", "启动后尝试打开 n8n 网页。"]
+}

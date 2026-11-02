@@ -1,0 +1,142 @@
+{
+  "$defs": {
+    "Capabilities": {
+      "additionalProperties": false,
+      "properties": {
+        "tools": {
+          "default": "unknown",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unknown"
+          ],
+          "title": "Tools",
+          "type": "string"
+        },
+        "reasoning": {
+          "default": "unknown",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unknown"
+          ],
+          "title": "Reasoning",
+          "type": "string"
+        },
+        "structured_output": {
+          "default": "unknown",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unknown"
+          ],
+          "title": "Structured Output",
+          "type": "string"
+        },
+        "token_count": {
+          "default": "unknown",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unknown"
+          ],
+          "title": "Token Count",
+          "type": "string"
+        },
+        "usage": {
+          "default": "unknown",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unknown"
+          ],
+          "title": "Usage",
+          "type": "string"
+        },
+        "remote_cancel": {
+          "default": "unknown",
+          "enum": [
+            "unsupported",
+            "unknown"
+          ],
+          "title": "Remote Cancel",
+          "type": "string"
+        },
+        "concurrency": {
+          "anyOf": [
+            {
+              "maximum": 64,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Concurrency"
+        }
+      },
+      "title": "Capabilities",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "pattern": "^[a-z][a-z0-9-]{0,47}$",
+      "title": "Id",
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "ollama",
+        "openai_compatible"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "base_url": {
+      "maxLength": 2048,
+      "title": "Base Url",
+      "type": "string"
+    },
+    "auth_env": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Z][A-Z0-9_]{0,95}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Auth Env"
+    },
+    "max_tokens_field": {
+      "default": "max_tokens",
+      "enum": [
+        "max_tokens",
+        "max_completion_tokens"
+      ],
+      "title": "Max Tokens Field",
+      "type": "string"
+    },
+    "developer_role": {
+      "default": false,
+      "title": "Developer Role",
+      "type": "boolean"
+    },
+    "capabilities": {
+      "$ref": "#/$defs/Capabilities"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "base_url"
+  ],
+  "title": "ProviderSpec",
+  "type": "object"
+}

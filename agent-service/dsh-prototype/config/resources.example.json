@@ -1,0 +1,27 @@
+{
+  "policy": {
+    "max_active": 1,
+    "validated_max_active": 1,
+    "max_waiting": 4,
+    "max_per_student": 1,
+    "queue_timeout_seconds": 10.0,
+    "min_free_bytes": 268435456,
+    "max_preparing": 2,
+    "preparation_queue_timeout_seconds": 5.0,
+    "preparation_timeout_seconds": 3.0,
+    "revalidation_timeout_seconds": 2.0,
+    "max_finishing": 2,
+    "finishing_queue_timeout_seconds": 10.0
+  },
+  "demand": {
+    "expected_online": null,
+    "peak_requests_per_minute": null,
+    "measured_requests_per_minute": null
+  },
+  "validation": {
+    "scope": "单进程本地门控初始配置，非模型推理容量测试",
+    "server_verified": false,
+    "platform_verified": false,
+    "automatic_scaling_enabled": false
+  }
+}

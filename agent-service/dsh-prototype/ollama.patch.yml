@@ -1,0 +1,21 @@
+# 只用于本地短对话：禁止默认模型可调用的文件、Shell 和 MCP 工具。
+- id: tool-fs
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: mcp-resources
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+# 短课程问答使用应用的有限资料，不额外发摘要/重试请求。
+- id: compaction-basic
+  disabled: true
+- id: image-offload
+  disabled: true
+- id: llm-retry
+  disabled: true
+# 提供方、预算及取消插件由runtime按可信配置插入。

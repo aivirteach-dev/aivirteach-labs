@@ -1,0 +1,12 @@
+{
+  "id": "server-model",
+  "kind": "openai_compatible",
+  "base_url": "https://model.example.invalid/v1",
+  "auth_env": "TUTOR_MODEL_API_KEY",
+  "max_tokens_field": "max_tokens",
+  "developer_role": false,
+  "capabilities": {
+    "tools": "unknown", "reasoning": "unknown", "structured_output": "unknown",
+    "token_count": "unknown", "usage": "unknown", "remote_cancel": "unknown", "concurrency": null
+  }
+}

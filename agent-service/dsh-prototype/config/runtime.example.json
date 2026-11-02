@@ -1,0 +1,21 @@
+{
+  "context_window": 8192,
+  "max_output_tokens": 512,
+  "total_timeout_seconds": 180,
+  "sdk_request_timeout_seconds": 120,
+  "execution_user": "dsh-runner",
+  "reasoning_effort": "off",
+  "reasoning_off_value": "none",
+  "execution_limits": {
+    "max_model_calls": 4,
+    "max_total_output_tokens": 2048,
+    "max_input_estimated_tokens_per_call": 6000,
+    "max_total_input_estimated_tokens": 24000,
+    "context_headroom_tokens": 512,
+    "max_request_bytes": 65536,
+    "max_output_bytes": 32768,
+    "max_runtime_events": 128
+  },
+  "ollama_base_url": "http://127.0.0.1:1/v1",
+  "model": "test-model"
+}
