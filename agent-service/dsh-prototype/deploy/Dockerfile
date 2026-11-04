@@ -18,6 +18,14 @@ COPY tools/isolated_health.py ./tools/isolated_health.py
 USER 1000:1000
 CMD ["python","-m","dsh_tutor.isolated_host","serve"]
 
+# 平台接口（与 main 的 agent-service 相同，端口 8770）。构建：docker build -f deploy/Dockerfile --target platform .
+FROM agent AS platform
+ENV TMPDIR=/native-cache AIVIRTEACH_DSH_STATE_DIR=/native-cache/runs AIVIRTEACH_DSH_EXECUTION_USER=dsh-runner
+EXPOSE 8770
+HEALTHCHECK --interval=15s --timeout=3s --retries=3 \
+    CMD ["python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3).read()"]
+CMD ["sh","-c","exec python -m uvicorn dsh_tutor.platform_app:app --host \"${AIVIRTEACH_AGENT_HOST:-0.0.0.0}\" --port \"${AIVIRTEACH_AGENT_PORT:-8770}\" --no-access-log"]
+
 FROM node-runtime AS frontend-build
 ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /build

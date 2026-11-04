@@ -1,5 +1,6 @@
 # 本机环境、私有配置和生成文件
 .venv/
+.venv310/
 .runtime/
 __pycache__/
 *.py[cod]

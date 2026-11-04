@@ -67,6 +67,8 @@ export function apply(ctx, config) {
     try {
       for await(const chunk of next()) {
         if(++chunks>(limits.max_stream_chunks ?? 8192)) stop('stream_chunks');
+        // 平台模式：学生断开或总超时后停止读取，不让模型在后台继续生成（旧接口语义不变）。
+        if(streamPath && config.cancelPath && chunks%16===0 && existsSync(config.cancelPath)) throw new Error('tutor_cancelled');
         if(Buffer.byteLength(JSON.stringify(chunk),'utf8')>limits.max_request_bytes) stop('output_bytes');
         const delta=chunk.type==='text-delta' ? chunk.text :
           chunk.type==='reasoning-delta' ? chunk.text :

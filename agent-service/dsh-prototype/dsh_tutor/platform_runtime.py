@@ -11,16 +11,17 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .execution_budget import ExecutionLimits
 from .providers import provider_for
-from .runtime import _metrics, build_budget_plugin, render_patch
+from .runtime import _metrics, build_budget_plugin, render_patch, require_execution_identity
 
 STREAM_POLL_SECONDS = 0.03
 MAX_STREAM_FILE_BYTES = 1_048_576
+TRUNCATED_FINISHES = {"length", "max-tokens"}
 
 
 @dataclass(frozen=True)
@@ -30,12 +31,14 @@ class DshSettings:
     provider_kind: str  # "ollama" 或 "openai_compatible"
     base_url: str
     model: str
-    api_key_env: str | None
+    api_key_env: Optional[str]
     context_window: int
     max_output_tokens: int
     total_timeout_seconds: int
     state_dir: Path
     reasoning_off: bool = True
+    reasoning_off_value: str = "none"
+    execution_user: Optional[str] = None
 
     def runtime_config(self) -> dict:
         limits = ExecutionLimits(
@@ -45,6 +48,7 @@ class DshSettings:
             max_input_estimated_tokens_per_call=self.context_window - self.max_output_tokens - 512,
             max_total_input_estimated_tokens=4 * self.context_window,
             max_request_bytes=262_144,
+            max_output_bytes=65_536,  # 约 2 万中文字符，高于回答上限 12000 字符
         )
         config = {
             "model": self.model,
@@ -54,7 +58,7 @@ class DshSettings:
             "execution_limits": limits.model_dump(),
         }
         if self.reasoning_off:
-            config.update(reasoning_effort="off", reasoning_off_value="none")
+            config.update(reasoning_effort="off", reasoning_off_value=self.reasoning_off_value)
         if self.provider_kind == "ollama":
             config["ollama_base_url"] = self.base_url
         else:
@@ -70,23 +74,27 @@ class DshSettings:
 @dataclass
 class RunOutcome:
     answer: str
-    finish_reason: str | None
-    usage: list[dict] = field(default_factory=list)
-    error: str | None = None
+    finish_reason: Optional[str]
+    usage: list = field(default_factory=list)
+    error: Optional[str] = None  # MODEL_BUDGET_EXHAUSTED / CANCELLED / MODEL_STREAM_OUTPUT_TRUNCATED
 
 
 class _StreamTail(threading.Thread):
-    """读取插件逐行追加的片段文件；只接受完整的 JSON 行。"""
+    """读取插件逐行追加的片段文件；只接受完整的 JSON 行。收到取消信号时写取消文件。"""
 
-    def __init__(self, path: Path, on_delta: Callable[[str], None]):
+    def __init__(self, path: Path, cancel_path: Path, on_delta: Callable[[str], None],
+                 cancel: Optional[threading.Event]):
         super().__init__(daemon=True)
-        self.path, self.on_delta = path, on_delta
-        self.usage: list[dict] = []
+        self.path, self.cancel_path, self.on_delta, self.cancel = path, cancel_path, on_delta, cancel
+        self.usage: list = []
+        self.finishes: list = []
         self._offset = 0
         self._stop = threading.Event()
 
     def run(self) -> None:
         while not self._stop.wait(STREAM_POLL_SECONDS):
+            if self.cancel is not None and self.cancel.is_set() and not self.cancel_path.exists():
+                self.cancel_path.touch()
             self._drain()
         self._drain()
 
@@ -108,24 +116,29 @@ class _StreamTail(threading.Thread):
                 self.on_delta(row["delta"])
             elif isinstance(row.get("usage"), dict):
                 self.usage.append(row["usage"])
+            elif isinstance(row.get("finish"), str):
+                self.finishes.append(row["finish"])
 
 
-def run_once(prompt: str, settings: DshSettings, on_delta: Callable[[str], None]) -> RunOutcome:
+def run_once(prompt: str, settings: DshSettings, on_delta: Callable[[str], None],
+             cancel: Optional[threading.Event] = None) -> RunOutcome:
     """阻塞执行一次 DSH 对话，应在工作线程中调用。"""
     from deepseek_harness import DeepSeekHarness
 
+    if settings.execution_user:
+        require_execution_identity({"execution_user": settings.execution_user})
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=settings.state_dir))
     try:
         config = settings.runtime_config()
         provider = provider_for(config)
-        stream_path = run_dir / "stream.jsonl"
+        stream_path, cancel_path = run_dir / "stream.jsonl", run_dir / "cancel.request"
         guard = build_budget_plugin(config, run_dir, stream_path=stream_path)
         patch = run_dir / "runtime.patch.yml"
         patch.write_text(render_patch(config, budget_plugin=guard), encoding="utf-8")
         host = urlsplit(provider.base_url).hostname
         env = {**provider.environment(), "NO_PROXY": f"{host},localhost,127.0.0.1", "no_proxy": f"{host},localhost,127.0.0.1"}
-        tail = _StreamTail(stream_path, on_delta)
+        tail = _StreamTail(stream_path, cancel_path, on_delta, cancel)
         tail.start()
         try:
             with DeepSeekHarness(
@@ -145,7 +158,14 @@ def run_once(prompt: str, settings: DshSettings, on_delta: Callable[[str], None]
         finally:
             tail.stop()
         metrics = _metrics(run_dir / "model-budget.json")
-        error = "MODEL_BUDGET_EXHAUSTED" if metrics.get("budget_stop") else None
+        if cancel_path.exists():
+            error = "CANCELLED"
+        elif metrics.get("budget_stop"):
+            error = "MODEL_BUDGET_EXHAUSTED"
+        elif tail.finishes and tail.finishes[-1] in TRUNCATED_FINISHES:
+            error = "MODEL_STREAM_OUTPUT_TRUNCATED"
+        else:
+            error = None
         return RunOutcome(result.final_response, result.finish_reason, tail.usage, error)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)

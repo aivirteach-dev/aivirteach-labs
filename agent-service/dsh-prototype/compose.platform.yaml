@@ -1,0 +1,45 @@
+# DSH 版平台 Agent：替换仓库根 compose.yaml 里的 agent-service（同为 8770 端口，二者不能同时运行）。
+# 在本目录执行：docker compose -f compose.platform.yaml --env-file ../../config.env up -d --build
+# 环境变量与 main 的 agent-service 相同；每个并发请求约占 190MB 独占内存（实测，qwen3.5:9b / Ollama）。
+name: dsh-platform
+services:
+  dsh-agent:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: platform
+    image: dsh-platform-agent:${DSH_PLATFORM_IMAGE_TAG:-local}
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - "/tmp:size=32m,mode=1777,noexec,nosuid,nodev"
+      # DSH 运行时需要可执行的临时目录（与 compose.isolated.yaml 相同的做法）。
+      - "/native-cache:size=64m,mode=0700,uid=1000,gid=1000,exec,nosuid,nodev"
+    pids_limit: 128
+    mem_limit: ${DSH_AGENT_MEM_LIMIT:-2g}
+    memswap_limit: ${DSH_AGENT_MEM_LIMIT:-2g}
+    stop_grace_period: 45s
+    environment:
+      AIVIRTEACH_AGENT_HOST: "0.0.0.0"
+      AIVIRTEACH_AGENT_PORT: "8770"
+      AIVIRTEACH_AGENT_TOKEN: "${AIVIRTEACH_AGENT_TOKEN:?Set AIVIRTEACH_AGENT_TOKEN}"
+      AIVIRTEACH_AGENT_CORS_ORIGINS: "${AIVIRTEACH_AGENT_CORS_ORIGINS:-http://127.0.0.1:8780,http://localhost:8780}"
+      AIVIRTEACH_COURSE_DIR: "/app/.cache/course/AI Daily Briefing/processed"
+      AIVIRTEACH_MODEL_PROVIDER: "${AIVIRTEACH_MODEL_PROVIDER:-fake}"
+      AIVIRTEACH_MODEL_BASE_URL: "${AIVIRTEACH_MODEL_BASE_URL:-}"
+      AIVIRTEACH_MODEL_API_KEY: "${AIVIRTEACH_MODEL_API_KEY:-}"
+      AIVIRTEACH_MODEL_NAME: "${AIVIRTEACH_MODEL_NAME:-}"
+      AIVIRTEACH_MODEL_THINKING: "${AIVIRTEACH_MODEL_THINKING:-}"
+      AIVIRTEACH_AGENT_TOTAL_TIMEOUT: "${AIVIRTEACH_AGENT_TOTAL_TIMEOUT:-40}"
+      AIVIRTEACH_MAX_CONCURRENT_REQUESTS: "${AIVIRTEACH_MAX_CONCURRENT_REQUESTS:-4}"
+      AIVIRTEACH_DSH_CONTEXT_WINDOW: "${AIVIRTEACH_DSH_CONTEXT_WINDOW:-32768}"
+      AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS: "${AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS:-4096}"
+      AIVIRTEACH_DSH_REASONING_OFF_VALUE: "${AIVIRTEACH_DSH_REASONING_OFF_VALUE:-none}"
+    ports:
+      - "${DSH_AGENT_BIND:-0.0.0.0}:8770:8770"
+    volumes:
+      - "${AIVIRTEACH_COURSE_CACHE_HOST:-../.cache/course}:/app/.cache/course:ro"

@@ -30,19 +30,31 @@ npm run build
 
 ## 平台接口（与 main 现有 Agent 相同）
 
-`dsh_tutor/platform_app.py` 提供与 `agent-service/aivirteach_agent` 完全相同的接口，Server 和 Client 不需要改动：`GET /health`、`GET /ready`、`POST /v1/agent/diagnose`、`POST /v1/agent/diagnose/stream`（SSE）。请求/返回格式复制自 main 的 `models.py`（`dsh_tutor/platform_models.py`），由 `sandbox/tests/test_platform_api.py` 自动对比两边的 JSON Schema；事件名和帧格式（`schema_version`、`request_id`、`sequence`）与 main 一致，`assistant_delta` 由预算插件转发模型的逐段输出。
+`dsh_tutor/platform_app.py` 提供与 `agent-service/aivirteach_agent` 完全相同的接口，Server 和 Client 不需要改动：`GET /health`、`GET /ready`、`POST /v1/agent/diagnose`、`POST /v1/agent/diagnose/stream`（SSE）、`/openapi.json`。请求/返回格式和课程资料补充逐字复制自 main（`platform_models.py`、`platform_course.py`），`sandbox/tests/test_platform_api.py` 自动对比两边的 JSON Schema；事件名和帧格式（`schema_version`、`request_id`、`sequence`）与 main 一致，`assistant_delta` 由预算插件转发模型的逐段输出。不保存聊天或学习记录，这些由 Server 负责。
 
-```bash
-export AIVIRTEACH_AGENT_TOKEN=...                       # 与 Server 相同的共享令牌
-export AIVIRTEACH_MODEL_PROVIDER=ollama                 # 或 openai_compatible（另需 AIVIRTEACH_MODEL_API_KEY）
-export AIVIRTEACH_MODEL_BASE_URL=http://<host>:11434/v1 # 必须以 /v1 结尾
-export AIVIRTEACH_MODEL_NAME=qwen3.5:9b
-.venv/bin/python -m uvicorn dsh_tutor.platform_app:app --host 127.0.0.1 --port 8770
-```
+### 启动
 
-可选：`AIVIRTEACH_AGENT_TOTAL_TIMEOUT`（默认 40 秒）、`AIVIRTEACH_MAX_CONCURRENT_REQUESTS`（默认 4，排队等待受总超时约束）、`AIVIRTEACH_MODEL_THINKING`（默认 disabled）、`AIVIRTEACH_DSH_CONTEXT_WINDOW`（默认 32768）、`AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS`（默认 1024）、`AIVIRTEACH_DSH_STATE_DIR`（每次请求的临时目录，结束即删）。
+- 宿主机：`./start_platform.sh`，读取与 main 相同的 `agent-service/config/agent.env`（可用 `AIVIRTEACH_AGENT_ENV_FILE` 指定）。
+- 容器：`docker compose -f compose.platform.yaml --env-file ../../config.env up -d --build`（`deploy/Dockerfile` 的 `platform` 阶段）。
 
-当前边界：尚未接入 Diagnostic Gateway 工具，回答的 `limitations` 含 `LIVE_DIAGNOSTICS_NOT_RUN`，`evidence`/`tool_trace` 为空；提供方没有缓存命中拆分时 `usage` 为 null（与 main 规则一致）。不保存聊天或学习记录，这些由 Server 负责。
+两种方式都占用 8770，与 main 的 agent-service 二选一。
+
+### 配置
+
+沿用 main 的变量：`AIVIRTEACH_AGENT_TOKEN`、`AIVIRTEACH_AGENT_HOST`/`PORT`、`AIVIRTEACH_AGENT_CORS_ORIGINS`、`AIVIRTEACH_COURSE_DIR`、`AIVIRTEACH_MODEL_PROVIDER`（`fake`、`ollama`、`openai_compatible`，默认 `fake`）、`AIVIRTEACH_MODEL_BASE_URL`（根地址如 `https://api.deepseek.com/` 会自动补 `/v1`）、`AIVIRTEACH_MODEL_API_KEY`、`AIVIRTEACH_MODEL_NAME`、`AIVIRTEACH_MODEL_THINKING`（只有 `enabled` 才开启思考）、`AIVIRTEACH_AGENT_TOTAL_TIMEOUT`（默认 40 秒，排队时间也计入）、`AIVIRTEACH_MAX_CONCURRENT_REQUESTS`（默认 4）。
+
+DSH 专用：`AIVIRTEACH_DSH_CONTEXT_WINDOW`（默认 32768）、`AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS`（默认 4096）、`AIVIRTEACH_DSH_REASONING_OFF_VALUE`（关闭思考时发给提供方的值，默认 `none`）、`AIVIRTEACH_DSH_STATE_DIR`（每次请求的临时目录，结束即删）、`AIVIRTEACH_DSH_EXECUTION_USER`（设置后核对运行账号，镜像内为 `dsh-runner`）。
+
+### 资源（实测，qwen3.5:9b / Ollama）
+
+每个并发请求起 1 个 DSH 运行时进程，约 11 个线程、190MB 独占内存（另有约 180MB 可共享的程序文件页）；首字 0.35～0.93 秒。调用方断开或总超时后会通知 DSH 停止生成，实测 0.3 秒内进程退出，名额在进程真正结束后才归还。
+
+### 当前边界
+
+- 尚未接入 Diagnostic Gateway 工具：`limitations` 含 `LIVE_DIAGNOSTICS_NOT_RUN`，`evidence`/`tool_trace` 为空。
+- 提供方没有缓存命中拆分时 `usage` 为 null（与 main 规则一致）；DeepSeek 的用量字段和关闭思考的参数尚未用真实密钥验证。
+- 回答超过输出上限时保留已生成内容，标记 `partial` 和 `MODEL_STREAM_OUTPUT_TRUNCATED`。
+- 容器部署文件未在 Docker 中实际构建验证。
 
 ## 已有接口和兼容边界
 

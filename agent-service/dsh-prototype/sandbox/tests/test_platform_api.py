@@ -1,7 +1,9 @@
 """平台接口契约：以 main 上 Server/Client 已在用的格式为准，不调用真实模型。"""
+import asyncio
 import importlib.util
 import json
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -9,7 +11,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from dsh_tutor import platform_models
-from dsh_tutor.platform_app import Settings, create_app, normalize_usage
+from dsh_tutor.platform_app import Diagnoser, Settings, create_app, normalize_base_url, normalize_usage
 from dsh_tutor.platform_runtime import RunOutcome
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,24 +41,32 @@ def body(**overrides):
 
 
 def answering(*pieces, finish="completed"):
-    def runner(prompt, dsh, on_delta):
+    def runner(prompt, dsh, on_delta, cancel):
         for piece in pieces:
             on_delta(piece)
         return RunOutcome("".join(pieces), finish, [])
     return runner
 
 
-def failing(prompt, dsh, on_delta):
+def failing(prompt, dsh, on_delta, cancel):
     raise RuntimeError("upstream down")
 
 
-def sleeping(prompt, dsh, on_delta):
+def sleeping(prompt, dsh, on_delta, cancel):
     time.sleep(1.5)
     return RunOutcome("late", "completed", [])
 
 
+class EmptyCourses:
+    course_count = 0
+
+    def enrich(self, request):
+        return request
+
+
 def client(runner=None, **overrides):
-    return TestClient(create_app(settings=settings(**overrides), runner=runner or answering("你好", "，世界")))
+    return TestClient(create_app(settings=settings(**overrides), runner=runner or answering("你好", "，世界"),
+                                 course_repository=EmptyCourses()))
 
 
 def headers(token=TOKEN):
@@ -186,6 +196,111 @@ class UsageTests(unittest.TestCase):
     def test_explicit_split_is_summed(self):
         usage = normalize_usage([{"cacheReadTokens": 1, "cacheMissTokens": 2, "outputTokens": 3}] * 2)
         self.assertEqual(usage.model_dump(), {"input_cache_hit_tokens": 2, "input_cache_miss_tokens": 4, "output_tokens": 6})
+
+
+class DeploymentConfigTests(unittest.TestCase):
+    """main 的 agent.env 原样可用：根地址、THINKING 为空或 disabled、fake 提供方。"""
+
+    def test_root_base_url_gets_v1(self):
+        self.assertEqual(normalize_base_url("https://api.deepseek.com/"), "https://api.deepseek.com/v1")
+        self.assertEqual(normalize_base_url("http://h:11434/v1/"), "http://h:11434/v1")
+        self.assertEqual(normalize_base_url(""), "")
+
+    def test_main_agent_env_values_are_ready(self):
+        for thinking in ("", "disabled", "enabled"):
+            ready = settings(model_provider="openai_compatible", model_base_url="https://api.deepseek.com/v1",
+                             model_name="deepseek-v4-flash", model_api_key_set=True, model_thinking=thinking)
+            self.assertEqual(ready.readiness_errors(), [], thinking)
+        self.assertTrue(settings(model_base_url="https://x/api").readiness_errors())
+
+    def test_thinking_is_off_unless_enabled(self):
+        self.assertTrue(settings(model_thinking="").dsh(10).reasoning_off)
+        self.assertFalse(settings(model_thinking="enabled").dsh(10).reasoning_off)
+
+    def test_fake_provider_needs_no_model_and_streams(self):
+        app = create_app(settings=settings(model_provider="fake", model_base_url="", model_name=""),
+                         course_repository=EmptyCourses())
+        c = TestClient(app)
+        self.assertEqual(c.get("/ready").json()["provider"], "fake")
+        frames = sse(c.post("/v1/agent/diagnose/stream", json=body(), headers=headers()).text)
+        result = frames[-2][1]["response"]
+        self.assertEqual(result["status"], "completed"); self.assertIn("fake", result["answer"])
+
+    def test_course_repository_enriches_request(self):
+        seen = {}
+
+        class Courses(EmptyCourses):
+            course_count = 3
+
+            def enrich(self, request):
+                seen["lesson"] = request.current_step.lesson_id
+                return request
+        c = TestClient(create_app(settings=settings(), runner=answering("好"), course_repository=Courses()))
+        self.assertEqual(c.get("/ready").json()["processed_courses"], 3)
+        c.post("/v1/agent/diagnose", json=body(), headers=headers())
+        self.assertEqual(seen, {"lesson": "install-n8n"})
+
+
+class BudgetAndCancelTests(unittest.TestCase):
+    def test_truncated_answer_is_kept_as_partial(self):
+        def truncated(prompt, dsh, on_delta, cancel):
+            on_delta("前半段")
+            return RunOutcome("前半段", "completed", [], "MODEL_STREAM_OUTPUT_TRUNCATED")
+        data = client(truncated).post("/v1/agent/diagnose", json=body(), headers=headers()).json()
+        self.assertEqual((data["status"], data["answer"]), ("partial", "前半段"))
+        self.assertIn("MODEL_STREAM_OUTPUT_TRUNCATED", data["limitations"])
+
+    def test_run_budget_never_exceeds_total_timeout(self):
+        seen = {}
+
+        def record(prompt, dsh, on_delta, cancel):
+            seen["timeout"] = dsh.total_timeout_seconds
+            return RunOutcome("好", "completed", [])
+        client(record, total_timeout_seconds=7).post("/v1/agent/diagnose", json=body(), headers=headers())
+        self.assertLessEqual(seen["timeout"], 7)
+
+    def test_timeout_signals_cancel_to_runner(self):
+        observed = threading.Event()
+
+        def waits(prompt, dsh, on_delta, cancel):
+            if cancel.wait(3):
+                observed.set()
+            return RunOutcome("", None, [], "CANCELLED")
+        client(waits, total_timeout_seconds=1).post("/v1/agent/diagnose", json=body(), headers=headers())
+        self.assertTrue(observed.wait(3))
+
+    def test_caller_disconnect_signals_cancel(self):
+        observed = threading.Event()
+
+        def waits(prompt, dsh, on_delta, cancel):
+            if cancel.wait(3):
+                observed.set()
+            return RunOutcome("", None, [], "CANCELLED")
+
+        async def scenario():
+            diagnoser = Diagnoser(settings(), waits, EmptyCourses())
+            task = asyncio.ensure_future(diagnoser.diagnose(platform_models.DiagnoseRequest.model_validate(body())))
+            await asyncio.sleep(0.2)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        asyncio.run(scenario())
+        self.assertTrue(observed.wait(3))
+
+    def test_slot_is_held_until_runner_really_ends(self):
+        release = threading.Event()
+
+        def slow(prompt, dsh, on_delta, cancel):
+            release.wait(5)
+            return RunOutcome("好", "completed", [])
+
+        async def scenario():
+            diagnoser = Diagnoser(settings(total_timeout_seconds=1, max_concurrent_requests=1), slow, EmptyCourses())
+            first = await diagnoser.diagnose(platform_models.DiagnoseRequest.model_validate(body()))
+            busy = diagnoser.slots.locked()
+            release.set()
+            await asyncio.sleep(0.3)
+            return first.status, busy, diagnoser.slots.locked()
+        self.assertEqual(asyncio.run(scenario()), ("partial", True, False))
 
 
 if __name__ == "__main__":
