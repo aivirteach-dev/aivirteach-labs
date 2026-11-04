@@ -1,22 +1,27 @@
-"""平台接口契约：以 main 上 Server/Client 已在用的格式为准，不调用真实模型。"""
+"""平台接口契约：以 main 上 Server/Client 已在用的格式为准，不调用真实模型或真实 Gateway。"""
 import asyncio
 import importlib.util
 import json
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 from dsh_tutor import platform_models
-from dsh_tutor.platform_app import Diagnoser, Settings, create_app, normalize_base_url, normalize_usage
+from dsh_tutor.platform_app import (Diagnoser, Settings, _AnswerFilter, create_app, normalize_base_url,
+                                    normalize_usage)
+from dsh_tutor.platform_mcp import ToolBridge, ToolContext
 from dsh_tutor.platform_runtime import RunOutcome
 
 ROOT = Path(__file__).resolve().parents[2]
-MAIN_MODELS = ROOT.parent / "aivirteach_agent" / "models.py"
+MAIN_AGENT = ROOT.parent / "aivirteach_agent"
 TOKEN = "t" * 40
+GATEWAY_TOKEN = "g" * 40
 # Client 的 read-tutor-stream.ts 认识的事件，加上 Server 自己处理的 result / error。
 CLIENT_EVENTS = {"accepted", "started", "reasoning_started", "reasoning_finished", "context_ready", "tool_started",
                  "tool_finished", "finalization_started", "assessment_validating", "assessment_validated",
@@ -27,7 +32,7 @@ def settings(**overrides):
     values = dict(agent_token=TOKEN, model_provider="ollama", model_base_url="http://127.0.0.1:1/v1",
                   model_name="test-model", model_api_key_set=False, model_thinking="disabled",
                   total_timeout_seconds=5, max_concurrent_requests=2, context_window=32768,
-                  max_output_tokens=1024, state_dir=Path("/nonexistent"))
+                  max_output_tokens=1024, state_dir=Path("/nonexistent"), diagnostic_token=GATEWAY_TOKEN)
     values.update(overrides)
     return Settings(**values)
 
@@ -41,18 +46,19 @@ def body(**overrides):
 
 
 def answering(*pieces, finish="completed"):
-    def runner(prompt, dsh, on_delta, cancel):
+    def runner(prompt, dsh, on_event, cancel, tools):
         for piece in pieces:
-            on_delta(piece)
+            on_event("delta", {"call": 1, "text": piece})
+        on_event("finish", {"call": 1, "kind": "stop"})
         return RunOutcome("".join(pieces), finish, [])
     return runner
 
 
-def failing(prompt, dsh, on_delta, cancel):
+def failing(prompt, dsh, on_event, cancel, tools):
     raise RuntimeError("upstream down")
 
 
-def sleeping(prompt, dsh, on_delta, cancel):
+def sleeping(prompt, dsh, on_event, cancel, tools):
     time.sleep(1.5)
     return RunOutcome("late", "completed", [])
 
@@ -95,18 +101,39 @@ def assert_server_accepts(test, response):
         test.assertEqual(set(usage), {"input_cache_hit_tokens", "input_cache_miss_tokens", "output_tokens"})
 
 
+def load_main(name):
+    """按包名加载 main 的模块；main 面向 Python 3.11+，在 3.10 上导入失败时跳过对比。"""
+    package = "main_agent"
+    if package not in sys.modules:
+        spec = importlib.util.spec_from_file_location(package, MAIN_AGENT / "__init__.py",
+                                                      submodule_search_locations=[str(MAIN_AGENT)])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[package] = module
+        spec.loader.exec_module(module)
+    return importlib.import_module(f"{package}.{name}")
+
+
 class ContractCopyTests(unittest.TestCase):
-    def test_models_match_main_agent(self):
-        spec = importlib.util.spec_from_file_location("main_agent_models", MAIN_MODELS)
-        main = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = main  # 延迟注解需要按模块名解析
+    def main_or_skip(self, name):
         try:
-            spec.loader.exec_module(main)
-        except ImportError as exc:  # main 面向 3.11+；在 3.10 上无法导入时只能跳过
-            self.skipTest(f"main models not importable on this Python: {exc}")
+            return load_main(name)
+        except ImportError as exc:
+            self.skipTest(f"main agent not importable on this Python: {exc}")
+
+    def test_models_match_main_agent(self):
+        main = self.main_or_skip("models")
         for name in ("DiagnoseRequest", "DiagnoseResponse"):
             self.assertEqual(getattr(platform_models, name).model_json_schema(),
                              getattr(main, name).model_json_schema(), name)
+
+    def test_tools_match_main_agent(self):
+        main = self.main_or_skip("tools")
+        from dsh_tutor import platform_tools
+        self.assertEqual({t.value for t in platform_tools.TOOL_SPECS}, {t.value for t in main.TOOL_SPECS})
+        for tool, spec in platform_tools.TOOL_SPECS.items():
+            other = main.TOOL_SPECS[main.ToolName(tool.value)]
+            self.assertEqual(spec.description, other.description, tool)
+            self.assertEqual(spec.input_schema(), other.args_model.model_json_schema(), tool)
 
 
 class AuthAndValidationTests(unittest.TestCase):
@@ -123,9 +150,10 @@ class AuthAndValidationTests(unittest.TestCase):
         self.assertEqual(client(agent_token="").post("/v1/agent/diagnose", json=body(), headers=headers()).status_code, 503)
 
     def test_not_ready_is_503(self):
-        c = client(model_name="")
-        self.assertEqual(c.get("/ready").status_code, 503)
-        self.assertEqual(c.post("/v1/agent/diagnose", json=body(), headers=headers()).status_code, 503)
+        for broken in ({"model_name": ""}, {"diagnostic_token": ""}):
+            c = client(**broken)
+            self.assertEqual(c.get("/ready").status_code, 503, broken)
+            self.assertEqual(c.post("/v1/agent/diagnose", json=body(), headers=headers()).status_code, 503, broken)
 
     def test_question_limit_matches_server(self):
         c = client()
@@ -164,8 +192,8 @@ class ResponseTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
-    def stream(self, runner=None, **overrides):
-        response = client(runner, **overrides).post("/v1/agent/diagnose/stream", json=body(), headers=headers())
+    def stream(self, runner=None, payload=None, **overrides):
+        response = client(runner, **overrides).post("/v1/agent/diagnose/stream", json=payload or body(), headers=headers())
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
         return sse(response.text)
@@ -186,6 +214,151 @@ class StreamTests(unittest.TestCase):
     def test_failure_still_ends_with_result_and_done(self):
         names = [e for e, _ in self.stream(failing)]
         self.assertIn("answer_failed", names); self.assertEqual(names[-2:], ["result", "done"])
+
+    def test_tool_run_streams_tool_events_evidence_and_hides_preamble(self):
+        evidence = {"id": "obs-001", "tool": "get_vm_status", "summary": "VM is running.",
+                    "captured_at": "2026-11-05T00:00:00Z"}
+        trace = {"tool": "get_vm_status", "status": "ok", "duration_ms": 12, "observation_id": "obs-001"}
+
+        def with_tools(prompt, dsh, on_event, cancel, tools):
+            assert tools is not None and tools.lab_id == "lab-001" and tools.gateway_token == GATEWAY_TOKEN
+            on_event("delta", {"call": 1, "text": "我先查一下。"})
+            on_event("block", {"call": 1, "type": "toolCall"})
+            on_event("tool_event", {"name": "tool_started", "data": {"tool": "get_vm_status"}})
+            on_event("tool_event", {"name": "tool_finished", "data": {"tool": "get_vm_status", "status": "ok"}})
+            on_event("finish", {"call": 1, "kind": "tool-calls"})
+            on_event("delta", {"call": 2, "text": "虚拟机正在运行。"})
+            on_event("finish", {"call": 2, "kind": "stop"})
+            return RunOutcome("虚拟机正在运行。", "completed", [], None, [evidence], [trace], [], False)
+
+        frames = self.stream(with_tools)
+        names = [e for e, _ in frames]
+        self.assertLess(names.index("tool_finished"), names.index("answer_started"))
+        self.assertEqual("".join(d["delta"] for e, d in frames if e == "assistant_delta"), "虚拟机正在运行。")
+        result = frames[-2][1]["response"]
+        assert_server_accepts(self, result)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual([e["id"] for e in result["evidence"]], ["obs-001"])
+        self.assertEqual(result["tool_trace"][0]["status"], "ok")
+        self.assertNotIn("LIVE_DIAGNOSTICS_NOT_RUN", result["limitations"])
+
+    def test_denied_tool_makes_result_partial(self):
+        trace = {"tool": "get_guest_journal", "status": "denied", "duration_ms": 1, "error_code": "TOOL_NOT_ALLOWED"}
+        runner = lambda p, d, e, c, t: RunOutcome("好", "completed", [], None, [], [trace], [], True)
+        result = self.stream(runner)[-2][1]["response"]
+        self.assertEqual(result["status"], "partial")
+
+    def test_empty_scope_runs_without_tools(self):
+        seen = {}
+
+        def record(prompt, dsh, on_event, cancel, tools):
+            seen["tools"], seen["prompt"] = tools, prompt
+            return answering("好")(prompt, dsh, on_event, cancel, tools)
+        result = self.stream(record, body(diagnostic_scope={"allowed_tools": []}))[-2][1]["response"]
+        self.assertIsNone(seen["tools"]); self.assertIn("本轮没有可用的检查工具", seen["prompt"])
+        self.assertIn("LIVE_DIAGNOSTICS_NOT_RUN", result["limitations"])
+
+
+class AnswerFilterTests(unittest.TestCase):
+    def test_short_text_before_tool_call_is_dropped(self):
+        f = _AnswerFilter()
+        self.assertEqual(f.delta(1, "我先查一下"), [])
+        self.assertEqual(f.block(1, "toolCall"), [])
+        self.assertEqual(f.finish(1, "tool-calls"), [])
+        self.assertEqual(f.delta(2, "结论"), [])
+        self.assertEqual(f.finish(2, "stop"), ["结论"])
+
+    def test_long_answer_starts_streaming_without_waiting_for_finish(self):
+        f = _AnswerFilter()
+        self.assertEqual(f.delta(1, "字" * 119), [])
+        self.assertEqual(f.delta(1, "字"), ["字" * 119, "字"])
+        self.assertEqual(f.delta(1, "后续"), ["后续"])
+
+
+class ToolBridgeTests(unittest.TestCase):
+    """工具桥对照 main orchestrator 的行为：校验、次数上限、缓存、Gateway 错误码、证据编号。"""
+
+    def bridge(self, handler, scope=None, **overrides):
+        events = Path(tempfile.mkdtemp()) / "events.jsonl"
+        context = ToolContext(lab_id="lab-001", scope=platform_models.DiagnosticScope(**(scope or {})),
+                              gateway_url="http://gateway.test:8765", gateway_token=GATEWAY_TOKEN,
+                              events_path=str(events), deadline_unix=time.time() + 30, **overrides)
+        calls = []
+
+        def transport(request):
+            calls.append(request)
+            return handler(request)
+        client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        return ToolBridge(context, client), calls, events
+
+    @staticmethod
+    def ok(request):
+        return httpx.Response(200, json={"ok": True, "summary": "VM is running.", "data": {"state": "running"}})
+
+    @staticmethod
+    def rows(events):
+        return [json.loads(line) for line in events.read_text().splitlines()]
+
+    def test_request_matches_gateway_contract(self):
+        bridge, calls, events = self.bridge(self.ok)
+        payload = asyncio.run(bridge.call("get_vm_status", {}))
+        request = calls[0]
+        self.assertEqual(str(request.url), "http://gateway.test:8765/v1/diagnostics/lab-001/tools/get_vm_status")
+        self.assertEqual(request.headers["authorization"], f"Bearer {GATEWAY_TOKEN}")
+        self.assertEqual(json.loads(request.content), {"parameters": {}})
+        self.assertEqual((payload["ok"], payload["observation_id"]), (True, "obs-001"))
+        kinds = [next(iter(r)) for r in self.rows(events)]
+        self.assertEqual(kinds, ["tool_event", "evidence", "trace", "tool_event"])
+
+    def test_out_of_scope_calls_are_denied_before_gateway(self):
+        bridge, calls, events = self.bridge(self.ok)
+        payload = asyncio.run(bridge.call("get_guest_journal", {"service": "docker.service"}))
+        self.assertEqual(payload["error_code"], "TOOL_NOT_ALLOWED"); self.assertEqual(calls, [])
+        self.assertIn({"partial": True}, self.rows(events))
+        scope = {"allowed_tools": ["get_guest_service_status"], "allowed_services": ["docker.service"]}
+        bridge, calls, _ = self.bridge(self.ok, scope)
+        self.assertEqual(asyncio.run(bridge.call("get_guest_service_status", {"service": "ssh.service"}))["error_code"],
+                         "SERVICE_NOT_ALLOWED")
+        self.assertEqual(calls, [])
+
+    def test_call_budget_counts_denied_calls(self):
+        bridge, calls, events = self.bridge(self.ok, max_tool_calls=2)
+        asyncio.run(bridge.call("nope", {})); asyncio.run(bridge.call("get_vm_status", {}))
+        payload = asyncio.run(bridge.call("get_vm_status", {}))
+        self.assertEqual(payload["error_code"], "TOOL_CALL_BUDGET_EXHAUSTED"); self.assertEqual(len(calls), 1)
+        self.assertIn({"limitation": "TOOL_CALL_BUDGET_EXHAUSTED"}, self.rows(events))
+
+    def test_identical_calls_are_cached(self):
+        bridge, calls, events = self.bridge(self.ok)
+        first = asyncio.run(bridge.call("get_vm_status", {}))
+        second = asyncio.run(bridge.call("get_vm_status", {}))
+        self.assertEqual(first, second); self.assertEqual(len(calls), 1)
+        self.assertEqual([r["trace"]["status"] for r in self.rows(events) if "trace" in r], ["ok", "cached"])
+
+    def test_gateway_status_codes_match_main(self):
+        expected = {401: "GATEWAY_AUTH_FAILED", 403: "GATEWAY_DENIED", 404: "VM_NOT_FOUND",
+                    409: "GUEST_AGENT_UNAVAILABLE", 422: "GATEWAY_INVALID_ARGUMENT", 504: "GATEWAY_TIMEOUT",
+                    500: "GATEWAY_ERROR"}
+        for status_code, code in expected.items():
+            bridge, _, events = self.bridge(lambda r, s=status_code: httpx.Response(s, json={"detail": "x"}))
+            self.assertEqual(asyncio.run(bridge.call("get_vm_status", {}))["error_code"], code)
+            self.assertIn({"limitation": code}, self.rows(events))
+
+    def test_unreachable_gateway_is_reported(self):
+        def down(request):
+            raise httpx.ConnectError("refused")
+        bridge, _, _ = self.bridge(down)
+        self.assertEqual(asyncio.run(bridge.call("get_vm_status", {}))["error_code"], "GATEWAY_UNAVAILABLE")
+
+    def test_secrets_in_tool_output_are_redacted(self):
+        leak = lambda r: httpx.Response(200, json={"summary": "env", "data": "password=hunter2 token=abc"})
+        bridge, _, _ = self.bridge(leak)
+        payload = asyncio.run(bridge.call("get_vm_status", {}))
+        self.assertNotIn("hunter2", json.dumps(payload)); self.assertGreater(payload["redaction_count"], 0)
+
+    def test_token_is_not_in_repr(self):
+        bridge, _, _ = self.bridge(self.ok)
+        self.assertNotIn(GATEWAY_TOKEN, repr(bridge.ctx))
 
 
 class UsageTests(unittest.TestCase):
@@ -228,6 +401,12 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertTrue(settings(model_thinking="").dsh(10).reasoning_off)
         self.assertFalse(settings(model_thinking="enabled").dsh(10).reasoning_off)
 
+    def test_reasoning_turns_map_to_model_calls(self):
+        self.assertEqual(settings(max_reasoning_turns=4).dsh(10).max_model_calls, 5)
+
+    def test_tokens_are_not_in_settings_repr(self):
+        self.assertNotIn(GATEWAY_TOKEN, repr(settings())); self.assertNotIn(TOKEN, repr(settings()))
+
     def test_fake_provider_needs_no_model_and_streams(self):
         app = create_app(settings=settings(model_provider="fake", model_base_url="", model_name=""),
                          course_repository=EmptyCourses())
@@ -254,8 +433,8 @@ class DeploymentConfigTests(unittest.TestCase):
 
 class BudgetAndCancelTests(unittest.TestCase):
     def test_truncated_answer_is_kept_as_partial(self):
-        def truncated(prompt, dsh, on_delta, cancel):
-            on_delta("前半段")
+        def truncated(prompt, dsh, on_event, cancel, tools):
+            on_event("delta", {"call": 1, "text": "前半段"})
             return RunOutcome("前半段", "completed", [], "MODEL_STREAM_OUTPUT_TRUNCATED")
         data = client(truncated).post("/v1/agent/diagnose", json=body(), headers=headers()).json()
         self.assertEqual((data["status"], data["answer"]), ("partial", "前半段"))
@@ -264,7 +443,7 @@ class BudgetAndCancelTests(unittest.TestCase):
     def test_run_budget_never_exceeds_total_timeout(self):
         seen = {}
 
-        def record(prompt, dsh, on_delta, cancel):
+        def record(prompt, dsh, on_event, cancel, tools):
             seen["timeout"] = dsh.total_timeout_seconds
             return RunOutcome("好", "completed", [])
         client(record, total_timeout_seconds=7).post("/v1/agent/diagnose", json=body(), headers=headers())
@@ -273,7 +452,7 @@ class BudgetAndCancelTests(unittest.TestCase):
     def test_timeout_signals_cancel_to_runner(self):
         observed = threading.Event()
 
-        def waits(prompt, dsh, on_delta, cancel):
+        def waits(prompt, dsh, on_event, cancel, tools):
             if cancel.wait(3):
                 observed.set()
             return RunOutcome("", None, [], "CANCELLED")
@@ -283,7 +462,7 @@ class BudgetAndCancelTests(unittest.TestCase):
     def test_caller_disconnect_signals_cancel(self):
         observed = threading.Event()
 
-        def waits(prompt, dsh, on_delta, cancel):
+        def waits(prompt, dsh, on_event, cancel, tools):
             if cancel.wait(3):
                 observed.set()
             return RunOutcome("", None, [], "CANCELLED")
@@ -300,7 +479,7 @@ class BudgetAndCancelTests(unittest.TestCase):
     def test_slot_is_held_until_runner_really_ends(self):
         release = threading.Event()
 
-        def slow(prompt, dsh, on_delta, cancel):
+        def slow(prompt, dsh, on_event, cancel, tools):
             release.wait(5)
             return RunOutcome("好", "completed", [])
 

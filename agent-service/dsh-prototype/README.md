@@ -30,32 +30,40 @@ npm run build
 
 ## 平台接口（与 main 现有 Agent 相同）
 
-`dsh_tutor/platform_app.py` 提供与 `agent-service/aivirteach_agent` 完全相同的接口，Server 和 Client 不需要改动：`GET /health`、`GET /ready`、`POST /v1/agent/diagnose`、`POST /v1/agent/diagnose/stream`（SSE）、`/openapi.json`。请求/返回格式和课程资料补充逐字复制自 main（`platform_models.py`、`platform_course.py`），`sandbox/tests/test_platform_api.py` 自动对比两边的 JSON Schema；事件名和帧格式（`schema_version`、`request_id`、`sequence`）与 main 一致，`assistant_delta` 由预算插件转发模型的逐段输出。不保存聊天或学习记录，这些由 Server 负责。
+`dsh_tutor/platform_app.py` 提供与 `agent-service/aivirteach_agent` 完全相同的接口，Server 和 Client 不需要改动：`GET /health`、`GET /ready`、`POST /v1/agent/diagnose`、`POST /v1/agent/diagnose/stream`（SSE）、`/openapi.json`。不保存聊天或学习记录，这些由 Server 负责。
+
+与 main 逐字对应的部分（`sandbox/tests/test_platform_api.py` 自动对比两边）：请求/返回格式（`platform_models.py`）、20 个只读工具的参数和授权校验（`platform_tools.py`）、脱敏规则（`platform_security.py`）、课程资料补充（`platform_course.py`）。SSE 事件名和帧格式（`schema_version`、`request_id`、`sequence`）、Gateway 错误码、证据编号（`obs-001`…）、工具调用次数上限也与 main 一致。
+
+### 一次请求怎么跑
+
+1. 按 Server 给的 `diagnostic_scope` 决定本轮可用工具（Server 不传时，与 main 一样只有 `get_vm_status`、`get_guest_agent_status`）。
+2. 启动一个 DSH 会话；工具通过 `platform_mcp.py`（MCP stdio）提供，每次调用先计数、校验授权，再调用 Gateway `POST /v1/diagnostics/{lab_id}/tools/{tool}`。
+3. 预算插件转发模型的逐段输出为 `assistant_delta`；工具桥的调用记录变成 `tool_started`/`tool_finished` 事件和返回里的 `evidence`、`tool_trace`。模型在调用工具前说的开场白不会显示给学生。
 
 ### 启动
 
 - 宿主机：`./start_platform.sh`，读取与 main 相同的 `agent-service/config/agent.env`（可用 `AIVIRTEACH_AGENT_ENV_FILE` 指定）。
 - 容器：`docker compose -f compose.platform.yaml --env-file ../../config.env up -d --build`（`deploy/Dockerfile` 的 `platform` 阶段）。
 
-两种方式都占用 8770，与 main 的 agent-service 二选一。
+两种方式都占用 8770，与 main 的 agent-service 二选一。用真实 Gateway 验收的步骤见 [docs/platform-gateway-test.md](docs/platform-gateway-test.md)；本地可用 `sandbox/fake_gateway.py` 代替 Gateway。
 
 ### 配置
 
-沿用 main 的变量：`AIVIRTEACH_AGENT_TOKEN`、`AIVIRTEACH_AGENT_HOST`/`PORT`、`AIVIRTEACH_AGENT_CORS_ORIGINS`、`AIVIRTEACH_COURSE_DIR`、`AIVIRTEACH_MODEL_PROVIDER`（`fake`、`ollama`、`openai_compatible`，默认 `fake`）、`AIVIRTEACH_MODEL_BASE_URL`（根地址如 `https://api.deepseek.com/` 会自动补 `/v1`）、`AIVIRTEACH_MODEL_API_KEY`、`AIVIRTEACH_MODEL_NAME`、`AIVIRTEACH_MODEL_THINKING`（只有 `enabled` 才开启思考）、`AIVIRTEACH_AGENT_TOTAL_TIMEOUT`（默认 40 秒，排队时间也计入）、`AIVIRTEACH_MAX_CONCURRENT_REQUESTS`（默认 4）。
+沿用 main 的变量：`AIVIRTEACH_AGENT_TOKEN`、`AIVIRTEACH_AGENT_HOST`/`PORT`、`AIVIRTEACH_AGENT_CORS_ORIGINS`、`AIVIRTEACH_COURSE_DIR`、`AIVIRTEACH_GATEWAY_URL`、`AIVIRTEACH_DIAGNOSTIC_TOKEN`、`AIVIRTEACH_MODEL_PROVIDER`（`fake`、`ollama`、`openai_compatible`，默认 `fake`）、`AIVIRTEACH_MODEL_BASE_URL`（根地址如 `https://api.deepseek.com/` 会自动补 `/v1`）、`AIVIRTEACH_MODEL_API_KEY`、`AIVIRTEACH_MODEL_NAME`、`AIVIRTEACH_MODEL_THINKING`（只有 `enabled` 才开启思考）、`AIVIRTEACH_AGENT_TOTAL_TIMEOUT`（默认 40 秒，排队时间也计入）、`AIVIRTEACH_TOOL_TIMEOUT`（8）、`AIVIRTEACH_MAX_REASONING_TURNS`（4）、`AIVIRTEACH_MAX_TOOL_CALLS`（6，含被拒绝的调用）、`AIVIRTEACH_MAX_TOOL_OUTPUT_CHARS`（32768）、`AIVIRTEACH_MAX_CONCURRENT_REQUESTS`（4）。`AIVIRTEACH_MODEL_TIMEOUT` 不使用：DSH 由总超时和插件预算约束。
 
 DSH 专用：`AIVIRTEACH_DSH_CONTEXT_WINDOW`（默认 32768）、`AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS`（默认 4096）、`AIVIRTEACH_DSH_REASONING_OFF_VALUE`（关闭思考时发给提供方的值，默认 `none`）、`AIVIRTEACH_DSH_STATE_DIR`（每次请求的临时目录，结束即删）、`AIVIRTEACH_DSH_EXECUTION_USER`（设置后核对运行账号，镜像内为 `dsh-runner`）。
 
-### 资源（实测，qwen3.5:9b / Ollama）
+### 实测（本地，假 Gateway）
 
-每个并发请求起 1 个 DSH 运行时进程，约 11 个线程、190MB 独占内存（另有约 180MB 可共享的程序文件页）；首字 0.35～0.93 秒。调用方断开或总超时后会通知 DSH 停止生成，实测 0.3 秒内进程退出，名额在进程真正结束后才归还。
+- DeepSeek `deepseek-v4-flash`：按授权依次调用容器、端口、日志工具并引用证据回答；`usage` 三项与提供方一致。Server 不传授权范围时调用默认的两个工具。
+- Ollama `qwen3.5:9b`：工具调用和证据正常，`usage` 为 null（不按缓存计量，与 main 一致）。
+- 每个并发请求 1 个 DSH 运行时进程，约 11 个线程、190MB 独占内存；首字 0.35～3 秒。调用方断开或总超时后通知 DSH 停止，实测 0.3 秒内退出。
 
 ### 当前边界
 
-- 尚未接入 Diagnostic Gateway 工具：`limitations` 含 `LIVE_DIAGNOSTICS_NOT_RUN`，`evidence`/`tool_trace` 为空。
-- `usage`：DeepSeek（`deepseek-v4-flash`）已实测，命中/未命中/输出三项与提供方一致；总数对不上或使用 Ollama 时为 null，不猜测（与 main 规则一致）。
-- 关闭思考：DeepSeek 已实测接受 `reasoning_effort: none`；不关闭时默认思考会占满输出预算，因此除非设为 `enabled`，否则一律关闭。
+- 结构化诊断字段 `diagnosis`、`course_alignment`、`suggested_actions` 留空：回答一次生成并逐段推送（不像 main 那样先单独生成结构化 JSON）。Server 只要求这些字段存在，Client 只显示 `answer`。
 - 回答超过输出上限时保留已生成内容，标记 `partial` 和 `MODEL_STREAM_OUTPUT_TRUNCATED`。
-- 容器部署文件未在 Docker 中实际构建验证。
+- 尚未在真实 Gateway / 真实 VM 上验收；容器部署文件未在 Docker 中实际构建。
 
 ## 已有接口和兼容边界
 

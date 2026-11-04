@@ -84,6 +84,7 @@ export function apply(ctx, config) {
         if(chunk.type==='text-delta' && typeof chunk.text==='string' && chunk.text.length) relay({call:state.model_calls,delta:chunk.text});
         else if(chunk.type==='usage' && chunk.usage && typeof chunk.usage==='object') relay({call:state.model_calls,usage:chunk.usage});
         else if(chunk.type==='finish') relay({call:state.model_calls,finish:chunk.reason?.kind ?? 'unknown'});
+        else if(chunk.type==='block-start') relay({call:state.model_calls,block:String(chunk.blockType ?? 'unknown')});
         yield chunk;
       }
     } finally {
