@@ -165,17 +165,22 @@ def build_prompt(request: DiagnoseRequest) -> str:
     return "\n\n".join(parts)
 
 
-def normalize_usage(chunks: list) -> Optional[Usage]:
-    """与 main 规则一致：没有明确的缓存命中/未命中拆分就返回 None，绝不猜测拆分。"""
-    if not chunks:
+def normalize_usage(chunks: list, provider_kind: str = "openai_compatible") -> Optional[Usage]:
+    """把 DSH（pi-ai）的用量换成 main 的三项计量；对不上就返回 None，绝不猜测拆分。
+
+    实测 DeepSeek 经 DSH：inputTokens 是未命中缓存的输入，有命中时另给 cacheReadTokens，
+    且 inputTokens + cacheReadTokens + outputTokens == totalTokens。Ollama 不按缓存计量，与 main 一样不上报。
+    """
+    if not chunks or provider_kind != "openai_compatible":
         return None
     hit = miss = out = 0
     for raw in chunks:
-        values = raw.get("cacheReadTokens"), raw.get("cacheMissTokens"), raw.get("outputTokens")
-        if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in values):
-            LOG.info("DSH usage has no cache split; reporting null (keys=%s)", sorted(raw))
+        values = raw.get("inputTokens"), raw.get("cacheReadTokens", 0), raw.get("outputTokens"), raw.get("totalTokens")
+        valid = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in values)
+        if not valid or raw.get("cacheWriteTokens") or values[0] + values[1] + values[2] != values[3]:
+            LOG.warning("DSH usage does not add up; reporting null (keys=%s)", sorted(raw))
             return None
-        hit, miss, out = hit + values[0], miss + values[1], out + values[2]
+        miss, hit, out = miss + values[0], hit + values[1], out + values[2]
     return Usage(input_cache_hit_tokens=hit, input_cache_miss_tokens=miss, output_tokens=out)
 
 
@@ -255,7 +260,7 @@ class Diagnoser:
             await emit("answer_failed", {"code": "MODEL_PROVIDER_ERROR"})
             return self._response(request, None, [*limitations, "MODEL_PROVIDER_ERROR"], None)
 
-        usage = normalize_usage(outcome.usage)
+        usage = normalize_usage(outcome.usage, self.settings.model_provider)
         answer = (outcome.answer or "".join(streamed)).strip()
         if len(answer) > MAX_ANSWER_CHARS:
             answer, outcome.error = answer[:MAX_ANSWER_CHARS], outcome.error or "MODEL_STREAM_OUTPUT_TRUNCATED"

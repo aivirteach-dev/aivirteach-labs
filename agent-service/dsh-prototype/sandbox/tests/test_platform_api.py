@@ -189,13 +189,24 @@ class StreamTests(unittest.TestCase):
 
 
 class UsageTests(unittest.TestCase):
-    def test_no_cache_split_is_null_not_zero(self):
-        self.assertIsNone(normalize_usage([{"inputTokens": 71, "outputTokens": 71, "totalTokens": 142}]))
-        self.assertIsNone(normalize_usage([]))
+    # 两组数据均为 DeepSeek 经 DSH 的实测值（第二次命中缓存）。
+    FIRST = {"inputTokens": 1867, "outputTokens": 25, "totalTokens": 1892}
+    CACHED = {"inputTokens": 202, "outputTokens": 25, "totalTokens": 1891, "cacheReadTokens": 1664}
 
-    def test_explicit_split_is_summed(self):
-        usage = normalize_usage([{"cacheReadTokens": 1, "cacheMissTokens": 2, "outputTokens": 3}] * 2)
-        self.assertEqual(usage.model_dump(), {"input_cache_hit_tokens": 2, "input_cache_miss_tokens": 4, "output_tokens": 6})
+    def test_deepseek_split_maps_to_main_fields(self):
+        self.assertEqual(normalize_usage([self.CACHED]).model_dump(),
+                         {"input_cache_hit_tokens": 1664, "input_cache_miss_tokens": 202, "output_tokens": 25})
+        self.assertEqual(normalize_usage([self.FIRST, self.CACHED]).model_dump(),
+                         {"input_cache_hit_tokens": 1664, "input_cache_miss_tokens": 2069, "output_tokens": 50})
+
+    def test_inconsistent_or_missing_usage_is_null_not_zero(self):
+        self.assertIsNone(normalize_usage([]))
+        self.assertIsNone(normalize_usage([{**self.FIRST, "totalTokens": 9999}]))
+        self.assertIsNone(normalize_usage([{"outputTokens": 3}]))
+        self.assertIsNone(normalize_usage([{**self.FIRST, "cacheWriteTokens": 5}]))
+
+    def test_ollama_usage_is_not_metered(self):
+        self.assertIsNone(normalize_usage([{"inputTokens": 71, "outputTokens": 71, "totalTokens": 142}], "ollama"))
 
 
 class DeploymentConfigTests(unittest.TestCase):

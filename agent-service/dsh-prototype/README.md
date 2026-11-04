@@ -52,7 +52,8 @@ DSH 专用：`AIVIRTEACH_DSH_CONTEXT_WINDOW`（默认 32768）、`AIVIRTEACH_DSH
 ### 当前边界
 
 - 尚未接入 Diagnostic Gateway 工具：`limitations` 含 `LIVE_DIAGNOSTICS_NOT_RUN`，`evidence`/`tool_trace` 为空。
-- 提供方没有缓存命中拆分时 `usage` 为 null（与 main 规则一致）；DeepSeek 的用量字段和关闭思考的参数尚未用真实密钥验证。
+- `usage`：DeepSeek（`deepseek-v4-flash`）已实测，命中/未命中/输出三项与提供方一致；总数对不上或使用 Ollama 时为 null，不猜测（与 main 规则一致）。
+- 关闭思考：DeepSeek 已实测接受 `reasoning_effort: none`；不关闭时默认思考会占满输出预算，因此除非设为 `enabled`，否则一律关闭。
 - 回答超过输出上限时保留已生成内容，标记 `partial` 和 `MODEL_STREAM_OUTPUT_TRUNCATED`。
 - 容器部署文件未在 Docker 中实际构建验证。
 
