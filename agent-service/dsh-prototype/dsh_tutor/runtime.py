@@ -152,14 +152,14 @@ def run_prompt(prompt,*,config_path,state_dir,tool_bridge=None):
         registration.close(outcome)
 
 
-def build_budget_plugin(config,run_dir,*,tool_bridge=None):
+def build_budget_plugin(config,run_dir,*,tool_bridge=None,stream_path=None):
     """由可信运行目录和工具桥构建唯一预算插件配置；模型不能指定路径或工具集。"""
     from .providers import provider_for
     return {'id':'tutor-model-budget','name':str(ROOT/'dsh_tutor/plugins/model_budget.mjs'),'config':{
         'limits':config['execution_limits'],'provider':provider_for(config).id,'model':config['model'],
         'maxTokens':config['max_output_tokens'],'contextWindow':config['context_window'],
         'deadlineUnix':time.time()+config['total_timeout_seconds'],
-        'allowedTools':['mcp__'+tool_bridge['server_name']+'__get_service_status'] if tool_bridge else [],'cancelPath':str(run_dir/'cancel.request'),'metricsPath':str(run_dir/'model-budget.json'),'progressPath':str(run_dir/'progress.jsonl')}}
+        'allowedTools':['mcp__'+tool_bridge['server_name']+'__get_service_status'] if tool_bridge else [],'cancelPath':str(run_dir/'cancel.request'),'metricsPath':str(run_dir/'model-budget.json'),'progressPath':str(run_dir/'progress.jsonl'),**({'streamPath':str(stream_path)} if stream_path else {})}}
 
 
 def build_control_plugin(run_dir,session_id):

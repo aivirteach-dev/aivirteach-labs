@@ -11,6 +11,9 @@ export const inject = ['llm'];
 
 export function apply(ctx, config) {
   const { limits, provider, model, maxTokens, contextWindow, deadlineUnix, metricsPath, progressPath } = config;
+  // 可选：平台接口用它把可见文字片段和实际用量实时交给Python（每行一个JSON，不含提示词）。
+  const streamPath = config.streamPath;
+  function relay(row) { if (streamPath) appendFileSync(streamPath, JSON.stringify(row)+'\n', {mode:0o600}); }
   if (!limits || !Number.isInteger(maxTokens) || maxTokens < 1 || !Number.isFinite(deadlineUnix)) {
     throw new Error('tutor_budget_config');
   }
@@ -76,6 +79,9 @@ export function apply(ctx, config) {
         }
         // 适配器也会合成error/abort finish；它们不是远端计算终态回执。
         if(chunk.type==='finish' && ['stop','tool-calls','length','max-tokens','content-filter'].includes(chunk.reason?.kind)) terminal=true;
+        if(chunk.type==='text-delta' && typeof chunk.text==='string' && chunk.text.length) relay({call:state.model_calls,delta:chunk.text});
+        else if(chunk.type==='usage' && chunk.usage && typeof chunk.usage==='object') relay({call:state.model_calls,usage:chunk.usage});
+        else if(chunk.type==='finish') relay({call:state.model_calls,finish:chunk.reason?.kind ?? 'unknown'});
         yield chunk;
       }
     } finally {

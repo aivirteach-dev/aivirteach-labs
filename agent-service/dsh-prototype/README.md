@@ -28,6 +28,22 @@ npm run build
 
 缺少 venv/ensurepip 时由环境管理员安装匹配的 `python3-venv`，不要 sudo pip 修改系统 Python。准备脚本不覆盖既有配置，只创建被忽略的 `config.json`、空结果目录和固定 Node 路径链接。默认模型地址 `http://127.0.0.1:1/v1` 不可用，正式运行身份仍是 `dsh-runner`。真实模型入口不可混入默认回归；模拟测试会在临时配置中显式使用当前测试身份。
 
+## 平台接口（与 main 现有 Agent 相同）
+
+`dsh_tutor/platform_app.py` 提供与 `agent-service/aivirteach_agent` 完全相同的接口，Server 和 Client 不需要改动：`GET /health`、`GET /ready`、`POST /v1/agent/diagnose`、`POST /v1/agent/diagnose/stream`（SSE）。请求/返回格式复制自 main 的 `models.py`（`dsh_tutor/platform_models.py`），由 `sandbox/tests/test_platform_api.py` 自动对比两边的 JSON Schema；事件名和帧格式（`schema_version`、`request_id`、`sequence`）与 main 一致，`assistant_delta` 由预算插件转发模型的逐段输出。
+
+```bash
+export AIVIRTEACH_AGENT_TOKEN=...                       # 与 Server 相同的共享令牌
+export AIVIRTEACH_MODEL_PROVIDER=ollama                 # 或 openai_compatible（另需 AIVIRTEACH_MODEL_API_KEY）
+export AIVIRTEACH_MODEL_BASE_URL=http://<host>:11434/v1 # 必须以 /v1 结尾
+export AIVIRTEACH_MODEL_NAME=qwen3.5:9b
+.venv/bin/python -m uvicorn dsh_tutor.platform_app:app --host 127.0.0.1 --port 8770
+```
+
+可选：`AIVIRTEACH_AGENT_TOTAL_TIMEOUT`（默认 40 秒）、`AIVIRTEACH_MAX_CONCURRENT_REQUESTS`（默认 4，排队等待受总超时约束）、`AIVIRTEACH_MODEL_THINKING`（默认 disabled）、`AIVIRTEACH_DSH_CONTEXT_WINDOW`（默认 32768）、`AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS`（默认 1024）、`AIVIRTEACH_DSH_STATE_DIR`（每次请求的临时目录，结束即删）。
+
+当前边界：尚未接入 Diagnostic Gateway 工具，回答的 `limitations` 含 `LIVE_DIAGNOSTICS_NOT_RUN`，`evidence`/`tool_trace` 为空；提供方没有缓存命中拆分时 `usage` 为 null（与 main 规则一致）。不保存聊天或学习记录，这些由 Server 负责。
+
 ## 已有接口和兼容边界
 
 接口版本 `dsh-tutor.v1`，严格字段 Schema 为 `docs/service-contract.schema.json`。可信宿主负责注入认证解析器和学生/任务/课程/VM 绑定；不能从学生正文构造授权。
