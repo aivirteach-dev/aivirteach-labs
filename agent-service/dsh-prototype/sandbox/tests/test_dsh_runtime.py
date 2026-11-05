@@ -141,6 +141,21 @@ class PatchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dsh_patch.Provider("p", "https://h/v1", name)
 
+    def test_reasoning_off_sends_none_only_when_thinking_is_disabled(self):
+        provider = dsh_patch.Provider("p", "https://h/v1", "KEY")
+
+        def efforts(off):
+            plugin = dsh_patch.provider_plugin(provider, model="m", context_window=8192, max_output_tokens=512,
+                                               reasoning_off=off)
+            return plugin["config"]["providers"]["p"]["models"][0].get("reasoningEfforts")
+        self.assertEqual(efforts(True), {"off": "none", "low": "low"})
+        self.assertIsNone(efforts(False))
+
+    def test_base_patch_disables_dsh_builtin_tools(self):
+        text = dsh_patch.BASE_PATCH.read_text(encoding="utf-8-sig")
+        for plugin in ("tool-fs", "tool-working-directory", "persistent-bash", "mcp-resources", "llm-retry"):
+            self.assertIn(f"- id: {plugin}\n  disabled: true", text)
+
     @unittest.skipUnless(HAVE_DSH, "deepseek-harness runtime is not installed")
     def test_dsh_official_telemetry_is_disabled(self):
         import deepseek_harness

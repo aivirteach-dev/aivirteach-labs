@@ -18,8 +18,7 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .dsh_patch import (Provider, budget_plugin, provider_plugin, read_budget_stop, render_patch,
-                        require_execution_identity, tool_plugin)
+from .dsh_patch import Provider, budget_plugin, provider_plugin, read_budget_stop, render_patch, tool_plugin
 from .platform_mcp import ToolContext, provider_tool_name
 
 STREAM_POLL_SECONDS = 0.03
@@ -44,8 +43,6 @@ class DshSettings:
     total_timeout_seconds: int
     state_dir: Path
     reasoning_off: bool = True
-    reasoning_off_value: str = "none"  # 关闭思考时发给提供方的值；DeepSeek 和 Ollama 都接受 "none"
-    execution_user: Optional[str] = None
     max_model_calls: int = 5  # main：最多 4 轮推理 + 1 次收尾
 
     def provider(self) -> Provider:
@@ -158,8 +155,6 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
 
     from deepseek_harness import DeepSeekHarness
 
-    if settings.execution_user:
-        require_execution_identity(settings.execution_user)
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=settings.state_dir))
     try:
@@ -167,7 +162,7 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
         stream_path, cancel_path = run_dir / "stream.jsonl", run_dir / "cancel.request"
         plugins = [provider_plugin(provider, model=settings.model, context_window=settings.context_window,
                                    max_output_tokens=settings.max_output_tokens,
-                                   reasoning_off_value=settings.reasoning_off_value if settings.reasoning_off else None)]
+                                   reasoning_off=settings.reasoning_off)]
         allowed = []
         if tools is not None and tools.scope.allowed_tools:
             allowed = [provider_tool_name(t.value) for t in sorted(tools.scope.allowed_tools, key=lambda t: t.value)]

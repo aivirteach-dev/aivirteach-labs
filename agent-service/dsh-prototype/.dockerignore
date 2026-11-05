@@ -1,6 +1,6 @@
 **
 !requirements.txt
-!ollama.patch.yml
+!dsh-base.patch.yml
 !dsh_tutor/
 !dsh_tutor/**
 **/__pycache__/

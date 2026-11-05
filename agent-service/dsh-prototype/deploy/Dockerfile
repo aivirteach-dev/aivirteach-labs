@@ -6,12 +6,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 1000 dsh-runner && useradd -u 1000 -g 1000 -m dsh-runner
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1 HOME=/home/dsh-runner \
-    TMPDIR=/native-cache AIVIRTEACH_DSH_STATE_DIR=/native-cache/runs AIVIRTEACH_DSH_EXECUTION_USER=dsh-runner \
+    TMPDIR=/native-cache AIVIRTEACH_DSH_STATE_DIR=/native-cache/runs \
     DSH_TELEMETRY_DISABLED=1
 WORKDIR /app
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir --disable-pip-version-check -r requirements.txt && python -m pip check
-COPY ollama.patch.yml ./
+COPY dsh-base.patch.yml ./
 COPY dsh_tutor/ ./dsh_tutor/
 USER 1000:1000
 EXPOSE 8770

@@ -1,4 +1,4 @@
-# 只用于本地短对话：禁止默认模型可调用的文件、Shell 和 MCP 工具。
+# 所有模型提供方共用的 DSH 基础补丁：关闭模型可调用的文件、Shell、MCP 资源，以及 DSH 自己的会话日志。
 - id: tool-fs
   disabled: true
 - id: tool-working-directory
@@ -18,4 +18,4 @@
   disabled: true
 - id: llm-retry
   disabled: true
-# 提供方、预算及取消插件由runtime按可信配置插入。
+# 提供方、预算插件和工具桥由 dsh_patch.py 按本次请求的可信配置追加在后面。

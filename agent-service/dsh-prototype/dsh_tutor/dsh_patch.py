@@ -16,8 +16,10 @@ from urllib.parse import urlsplit
 from .platform_mcp import SERVER_NAME
 
 ROOT = Path(__file__).resolve().parent.parent
-BASE_PATCH = ROOT / "ollama.patch.yml"
+BASE_PATCH = ROOT / "dsh-base.patch.yml"
 BUDGET_PLUGIN = ROOT / "dsh_tutor" / "plugins" / "model_budget.mjs"
+# 关闭思考时发给提供方的值；DeepSeek 和 Ollama 实测都接受。
+REASONING_OFF_VALUE = "none"
 OLLAMA_KEY_ENV = "OLLAMA_PLACEHOLDER_KEY"  # Ollama 不需要密钥，但 DSH 要求提供一个变量名
 
 
@@ -49,12 +51,12 @@ class Provider:
 
 
 def provider_plugin(provider: Provider, *, model: str, context_window: int, max_output_tokens: int,
-                    reasoning_off_value: Optional[str]) -> dict:
+                    reasoning_off: bool) -> dict:
     """用 DSH 的 pi-ai 适配注册一个 OpenAI 兼容提供方；关闭思考时给出提供方接受的值。"""
     entry = {"id": model, "name": model, "api": "openai-completions", "contextWindow": context_window,
              "maxTokens": max_output_tokens, "compat": {"supportsDeveloperRole": False, "maxTokensField": "max_tokens"}}
-    if reasoning_off_value:
-        entry["reasoningEfforts"] = {"off": reasoning_off_value, "low": "low"}
+    if reasoning_off:
+        entry["reasoningEfforts"] = {"off": REASONING_OFF_VALUE, "low": "low"}
     return {"id": "llm-pi-ai", "name": "@deepseek-ai/dsh-llm-pi-ai", "config": {"providers": {provider.id: {
         "displayName": provider.id, "apiKeyEnv": provider.api_key_env or OLLAMA_KEY_ENV, "api": "openai-completions",
         "baseURL": provider.base_url, "defaultContextWindow": context_window, "defaultMaxTokens": max_output_tokens,
@@ -92,11 +94,3 @@ def read_budget_stop(run_dir: Path) -> Optional[str]:
     value = json.loads(path.read_text(encoding="utf-8")).get("budget_stop")
     return value if isinstance(value, str) else None
 
-
-def require_execution_identity(expected: str) -> None:
-    """设置了运行账号时核对；不替代容器或操作系统隔离。"""
-    import pwd
-
-    actual = pwd.getpwuid(os.geteuid()).pw_name
-    if actual != expected:
-        raise PermissionError(f"DSH must run as {expected}, not {actual}")

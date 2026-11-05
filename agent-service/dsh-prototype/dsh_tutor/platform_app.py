@@ -77,8 +77,6 @@ class Settings:
     max_output_tokens: int
     state_dir: Path
     course_directory: Path = DEFAULT_COURSE_DIRECTORY
-    reasoning_off_value: str = "none"
-    execution_user: Optional[str] = None
     gateway_url: str = "http://127.0.0.1:8765"
     diagnostic_token: str = field(default="", repr=False)
     tool_timeout_seconds: int = 8
@@ -101,8 +99,6 @@ class Settings:
             max_output_tokens=_int_env("AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS", 4_096, 256, 8_192),
             state_dir=Path(os.getenv("AIVIRTEACH_DSH_STATE_DIR", str(Path(tempfile.gettempdir()) / "aivirteach-dsh"))),
             course_directory=Path(os.getenv("AIVIRTEACH_COURSE_DIR", str(DEFAULT_COURSE_DIRECTORY))),
-            reasoning_off_value=os.getenv("AIVIRTEACH_DSH_REASONING_OFF_VALUE", "none").strip() or "none",
-            execution_user=os.getenv("AIVIRTEACH_DSH_EXECUTION_USER") or None,
             # 以下变量名、默认值和范围与 main 的 config.py 相同。
             gateway_url=os.getenv("AIVIRTEACH_GATEWAY_URL", "http://127.0.0.1:8765").rstrip("/"),
             diagnostic_token=os.getenv("AIVIRTEACH_DIAGNOSTIC_TOKEN", ""),
@@ -145,8 +141,6 @@ class Settings:
             state_dir=self.state_dir,
             # 未设置时也关闭思考：课程问答不需要，且思考内容会占用输出预算。
             reasoning_off=self.model_thinking != "enabled",
-            reasoning_off_value=self.reasoning_off_value,
-            execution_user=self.execution_user,
             max_model_calls=self.max_reasoning_turns + 1,
         )
 
