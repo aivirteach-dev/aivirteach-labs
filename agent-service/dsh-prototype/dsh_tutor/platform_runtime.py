@@ -75,6 +75,7 @@ class RunOutcome:
     limitations: list = field(default_factory=list)
     partial: bool = False
     calls: list = field(default_factory=list)  # ModelCall；没有 end_ms 的调用即“未正常结束”
+    tool_events: list = field(default_factory=list)  # {name, t, data}：tool_started / tool_finished
 
 
 class _StreamTail(threading.Thread):
@@ -84,6 +85,7 @@ class _StreamTail(threading.Thread):
         super().__init__(daemon=True)
         self.path, self.cancel_path, self.on_event, self.cancel = path, cancel_path, on_event, cancel
         self.calls: dict = {}
+        self.tool_events: list = []
         self.evidence: list = []
         self.traces: list = []
         self.limitations: list = []
@@ -137,7 +139,9 @@ class _StreamTail(threading.Thread):
                 record.end_ms, record.error = t, row["error"]
             self.on_event("error", {"call": call, "t": t, "code": row["error"]})
         elif isinstance(row.get("tool_event"), str):
-            self.on_event("tool_event", {"name": row["tool_event"], "t": t, "data": row.get("data") or {}})
+            event = {"name": row["tool_event"], "t": t, "data": row.get("data") or {}}
+            self.tool_events.append(event)
+            self.on_event("tool_event", event)
         elif isinstance(row.get("evidence"), dict):
             self.evidence.append(row["evidence"])
         elif isinstance(row.get("trace"), dict):
@@ -222,6 +226,6 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
         else:
             error = None
         return RunOutcome(answer, finish_reason, [c.usage for c in calls if c.usage], error,
-                          tail.evidence, tail.traces, tail.limitations, tail.partial, calls)
+                          tail.evidence, tail.traces, tail.limitations, tail.partial, calls, tail.tool_events)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)

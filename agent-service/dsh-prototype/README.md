@@ -18,7 +18,7 @@
 4. `plugins/model_budget.mjs`（预算插件）：每次模型调用前检查次数、单次输出上限、工具集、总时限、取消；把文字片段、用量、结束原因写进事件文件。
 5. `platform_mcp.py`（工具桥，MCP stdio）：按 Server 给的 `diagnostic_scope` 校验后调用 Gateway `POST /v1/diagnostics/{lab_id}/tools/{tool}`，写证据和调用记录。Server 不传范围时，与 main 一样只有 `get_vm_status`、`get_guest_agent_status`。
 
-事件文件每行带毫秒时间戳 `t`；`RunOutcome.calls` 给出每次模型调用的开始、首字、结束时间、结束原因和用量，供监控使用。DSH 官方遥测会把会话发往 DeepSeek，已用 `DSH_TELEMETRY_DISABLED=1` 关闭。
+事件文件每行带毫秒时间戳 `t`；`RunOutcome.calls` 给出每次模型调用的开始、首字、结束时间、结束原因和用量，监控据此按 OpenTelemetry 发送到 Phoenix，见 [docs/monitoring.md](docs/monitoring.md)。DSH 官方遥测会把会话发往 DeepSeek，已用 `DSH_TELEMETRY_DISABLED=1` 关闭。
 
 ## 启动
 
@@ -47,6 +47,7 @@ python3 -m venv .venv
 - `sandbox/tests/test_platform_api.py`：接口契约、鉴权、SSE、工具桥、用量、取消（不启动 DSH）。Python 3.11+ 且能导入 main 的 Agent 时，自动对比复制过来的模型、工具和脱敏代码。
 - `sandbox/tests/test_dsh_runtime.py`：真实 DSH + 假模型（`sandbox/fake_model.py`）+ 假 Gateway（`sandbox/fake_gateway.py`），检查文字片段、用量、工具调用、预算停止、截断、取消和时间戳。
 - `sandbox/tests/test_model_budget.mjs`：预算插件单元测试。
+- `sandbox/tests/test_telemetry.py`：监控 span 的结构、属性、token 换算、失败标记和隐私默认值（内存导出，不需要 Phoenix）。
 
 ## 实测（本地，假 Gateway）
 
@@ -59,4 +60,4 @@ python3 -m venv .venv
 - `diagnosis`、`course_alignment`、`suggested_actions` 留空：回答一次生成并逐段推送（main 先单独生成结构化 JSON）。Server 只要求这些字段存在，Client 只显示 `answer`。
 - 回答超过输出上限时保留已生成内容，标记 `partial` 和 `MODEL_STREAM_OUTPUT_TRUNCATED`。
 - 尚未在真实 Gateway / 真实 VM 上验收；镜像未在 Docker 中实际构建。
-- 监控（OpenTelemetry + Phoenix）在后续阶段接入，数据来源是 `RunOutcome.calls` 和工具调用记录。
+- 监控已能发送到 Phoenix 并在本机验证；服务器上的 Phoenix 部署和告警是后续阶段。

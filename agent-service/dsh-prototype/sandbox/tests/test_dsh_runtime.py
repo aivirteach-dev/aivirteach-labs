@@ -96,6 +96,7 @@ class DshRuntimeTests(unittest.TestCase):
         self.assertEqual([e["id"] for e in outcome.evidence], ["obs-001"])
         self.assertEqual([(t["tool"], t["status"]) for t in outcome.tool_trace], [("get_vm_status", "ok")])
         self.assertEqual([d["name"] for d in events.kinds("tool_event")], ["tool_started", "tool_finished"])
+        self.assertEqual(outcome.tool_events, events.kinds("tool_event"))
         self.assertEqual([t["function"]["name"] for t in requests[0]["tools"]], ["mcp__aivirteach_tools__get_vm_status"])
         first, second = outcome.calls
         started = events.kinds("tool_event")[0]["t"]

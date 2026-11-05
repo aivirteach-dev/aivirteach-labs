@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,7 @@ from .platform_mcp import ToolContext
 from .platform_models import (CourseAlignment, DiagnoseRequest, DiagnoseResponse, Diagnosis, Evidence,
                               ToolTrace, Usage)
 from .platform_runtime import DshSettings, RunOutcome, run_once
+from .telemetry import RequestTrace, Telemetry, provider_name
 
 LOG = logging.getLogger("aivirteach.dsh_agent")
 SSE_HEARTBEAT_SECONDS = 10
@@ -264,11 +266,22 @@ class _AnswerFilter:
 class Diagnoser:
     """一次请求：排队 → DSH 运行（片段和工具事件实时转发）→ 组装 DiagnoseResponse。"""
 
-    def __init__(self, settings: Settings, runner: Runner, courses: CourseRepository):
+    def __init__(self, settings: Settings, runner: Runner, courses: CourseRepository,
+                 telemetry: Optional[Telemetry] = None):
         self.settings, self.runner, self.courses = settings, runner, courses
+        self.telemetry = telemetry or Telemetry()
         self.slots = asyncio.Semaphore(settings.max_concurrent_requests)
 
     async def diagnose(self, request: DiagnoseRequest, publish: Optional[Publish] = None) -> DiagnoseResponse:
+        trace, response = RequestTrace(), None
+        try:
+            response = await self._diagnose(request, publish, trace)
+            return response
+        finally:  # 调用方断开时 response 为 None，监控记为 CLIENT_DISCONNECTED
+            self.telemetry.record(request, response, trace, stream=publish is not None)
+
+    async def _diagnose(self, request: DiagnoseRequest, publish: Optional[Publish],
+                        trace: RequestTrace) -> DiagnoseResponse:
         async def emit(event: str, data: dict) -> None:
             if publish is not None:
                 await publish(event, data)
@@ -284,6 +297,7 @@ class Diagnoser:
             await emit("answer_failed", {"code": "AGENT_BUSY"})
             return self._response(request, None, [*limitations, "AGENT_BUSY"], None)
 
+        trace.queue_wait_ms = (time.time_ns() - trace.started_ns) // 1_000_000
         # 排队用掉的时间要从模型运行预算里扣掉，否则返回兜底后模型还在后台算。
         remaining = max(1, int(deadline - loop.time()))
         cancel = threading.Event()
@@ -294,6 +308,7 @@ class Diagnoser:
             self.settings.tools(request, remaining)))
         # 名额等运行线程真正结束才归还，避免实际并发超过上限。
         task.add_done_callback(lambda _: self.slots.release())
+        trace.task = task
         await emit("reasoning_started", {"turn": 1})
 
         streamed: list = []
@@ -389,12 +404,21 @@ def _sse_event(event: str, data: dict) -> str:
 
 
 def create_app(*, settings: Optional[Settings] = None, runner: Optional[Runner] = None,
-               course_repository: Optional[CourseRepository] = None) -> FastAPI:
+               course_repository: Optional[CourseRepository] = None,
+               telemetry: Optional[Telemetry] = None) -> FastAPI:
     config = settings or Settings.from_env()
     courses = course_repository or CourseRepository(config.course_directory)
     selected_runner = runner or (fake_runner if config.model_provider == "fake" else run_once)
-    diagnoser = Diagnoser(config, selected_runner, courses)
-    app = FastAPI(title="AIVirTeach Troubleshooting Agent (DSH)", version="0.3.0",
+    monitor = telemetry or Telemetry.from_env(provider_name=provider_name(config.model_provider, config.model_base_url),
+                                              model=config.model_name or config.model_provider)
+    diagnoser = Diagnoser(config, selected_runner, courses, monitor)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        monitor.shutdown()  # 退出前发完缓冲的监控数据
+
+    app = FastAPI(title="AIVirTeach Troubleshooting Agent (DSH)", version="0.3.0", lifespan=lifespan,
                   description="Same platform contract as aivirteach_agent; runs on DeepSeek Harness.")
     origins = os.getenv("AIVIRTEACH_AGENT_CORS_ORIGINS", "http://127.0.0.1:8780,http://localhost:8780")
     app.add_middleware(CORSMiddleware, allow_origins=[o.strip().rstrip("/") for o in origins.split(",") if o.strip()],
