@@ -1,9 +1,0 @@
-{
-  "lifecycle": {"max_operations_per_context": 1000},
-  "diagnostics": {"max_events": 200,"page_limit": 20},
-  "maintenance": {
-    "max_backup_files": 5,"max_validation_runs": 3,"max_backup_bytes": 67108864,
-    "min_free_bytes": 268435456,"deadline_seconds": 30.0,"pages_per_step": 64
-  },
-  "scope": "可信配置示例，自动归档/备份/删除未实现且不启用；不是生产保留政策。"
-}

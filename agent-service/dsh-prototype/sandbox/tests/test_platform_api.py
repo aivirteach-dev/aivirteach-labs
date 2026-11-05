@@ -297,7 +297,9 @@ class ToolBridgeTests(unittest.TestCase):
 
     @staticmethod
     def rows(events):
-        return [json.loads(line) for line in events.read_text().splitlines()]
+        rows = [json.loads(line) for line in events.read_text().splitlines()]
+        assert all(isinstance(row.pop("t"), int) for row in rows), "every row carries a millisecond timestamp"
+        return rows
 
     def test_request_matches_gateway_contract(self):
         bridge, calls, events = self.bridge(self.ok)

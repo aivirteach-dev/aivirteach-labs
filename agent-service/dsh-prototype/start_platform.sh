@@ -34,5 +34,7 @@ fi
 
 cd "$MODULE_DIR"
 export PYTHONDONTWRITEBYTECODE=1
+# DSH 官方遥测会把会话发往 DeepSeek，保持关闭。
+export DSH_TELEMETRY_DISABLED=1
 exec "$PYTHON_BIN" -m uvicorn dsh_tutor.platform_app:app \
   --host "$AGENT_HOST" --port "$AGENT_PORT" --no-access-log

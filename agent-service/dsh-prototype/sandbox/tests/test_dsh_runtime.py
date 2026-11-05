@@ -1,0 +1,172 @@
+"""真实 DSH 运行时 + 假模型（sandbox/fake_model.py）+ 假 Gateway：验证插件转发、工具、预算、取消和时间戳。
+
+不连真实模型或真实 Gateway。DSH 运行时未安装时整组跳过；node 不在 PATH 时跳过插件单元测试。
+"""
+import os
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+from dsh_tutor import dsh_patch, platform_models
+from dsh_tutor.platform_app import normalize_usage
+from dsh_tutor.platform_mcp import ToolContext
+from dsh_tutor.platform_runtime import DshSettings, run_once
+from sandbox import fake_gateway, fake_model
+
+ROOT = Path(__file__).resolve().parents[2]
+KEY_ENV = "AIVIRTEACH_TEST_MODEL_KEY"
+GATEWAY_TOKEN = "g" * 40
+
+try:
+    import deepseek_harness  # noqa: F401
+    HAVE_DSH = True
+except ImportError:
+    HAVE_DSH = False
+
+
+def dsh_settings(base_url, state_dir, **overrides):
+    values = dict(provider_kind="openai_compatible", base_url=base_url + "/v1", model="fake-model",
+                  api_key_env=KEY_ENV, context_window=32768, max_output_tokens=1024, total_timeout_seconds=30,
+                  state_dir=Path(state_dir), max_model_calls=5)
+    values.update(overrides)
+    return DshSettings(**values)
+
+
+class Recorder:
+    def __init__(self):
+        self.events = []
+        self.lock = threading.Lock()
+
+    def __call__(self, kind, data):
+        with self.lock:
+            self.events.append((kind, data))
+
+    def kinds(self, kind):
+        return [data for k, data in self.events if k == kind]
+
+
+@unittest.skipUnless(HAVE_DSH, "deepseek-harness runtime is not installed")
+class DshRuntimeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ[KEY_ENV] = "fake-key-0123456789"
+        os.environ["AIVIRTEACH_DIAGNOSTIC_TOKEN"] = GATEWAY_TOKEN
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="dsh-test-")
+        self.addCleanup(shutil.rmtree, self.state, True)
+
+    def run_script(self, script, tools=None, cancel=None, on_event=None, **overrides):
+        app = fake_model.create_app(script)
+        recorder = on_event or Recorder()
+        with fake_model.serve(app) as url:
+            outcome = run_once("问题", dsh_settings(url, self.state, **overrides), recorder, cancel, tools(url) if tools else None)
+        self.assertEqual(os.listdir(self.state), [], "run directory must be removed")
+        return outcome, recorder, app.state.requests
+
+    def tools(self, gateway_url, allowed=("get_vm_status",)):
+        return ToolContext(lab_id="lab-001", scope=platform_models.DiagnosticScope(allowed_tools=set(allowed)),
+                           gateway_url=gateway_url, gateway_token=GATEWAY_TOKEN, events_path="",
+                           deadline_unix=time.time() + 30)
+
+    def test_text_is_streamed_with_usage_and_timings(self):
+        outcome, events, requests = self.run_script([{"text": ["你好", "，世界"]}])
+        self.assertEqual((outcome.answer, outcome.finish_reason, outcome.error), ("你好，世界", "completed", None))
+        self.assertEqual("".join(d["text"] for d in events.kinds("delta")), "你好，世界")
+        [call] = outcome.calls
+        self.assertEqual(call.finish, "stop")
+        self.assertTrue(call.start_ms <= call.first_delta_ms <= call.end_ms)
+        usage = normalize_usage(outcome.usage)
+        prompt, cached, completion = (fake_model.USAGE[k] for k in ("prompt", "cached", "completion"))
+        self.assertEqual((usage.input_cache_hit_tokens, usage.input_cache_miss_tokens, usage.output_tokens),
+                         (cached, prompt - cached, completion))
+        self.assertEqual(len(requests), 1)
+        self.assertFalse(requests[0].get("tools"))
+        self.assertEqual(requests[0].get("reasoning_effort"), "none")
+
+    def test_tool_call_reaches_gateway_and_is_timed_between_model_calls(self):
+        with fake_model.serve(fake_gateway.app) as gateway:
+            outcome, events, requests = self.run_script(
+                [{"tool": "get_vm_status"}, {"text": ["虚拟机在运行 [obs-001]"]}], tools=lambda _: self.tools(gateway))
+        self.assertIsNone(outcome.error)
+        self.assertEqual([e["id"] for e in outcome.evidence], ["obs-001"])
+        self.assertEqual([(t["tool"], t["status"]) for t in outcome.tool_trace], [("get_vm_status", "ok")])
+        self.assertEqual([d["name"] for d in events.kinds("tool_event")], ["tool_started", "tool_finished"])
+        self.assertEqual([t["function"]["name"] for t in requests[0]["tools"]], ["mcp__aivirteach_tools__get_vm_status"])
+        first, second = outcome.calls
+        started = events.kinds("tool_event")[0]["t"]
+        self.assertTrue(first.end_ms <= started <= second.start_ms)
+        self.assertNotIn(GATEWAY_TOKEN, repr(events.events))
+
+    def test_model_call_limit_stops_the_run(self):
+        with fake_model.serve(fake_gateway.app) as gateway:
+            outcome, _, requests = self.run_script([{"tool": "get_vm_status"}, {"text": ["不会到这里"]}],
+                                                   tools=lambda _: self.tools(gateway), max_model_calls=1)
+        self.assertEqual(outcome.error, "MODEL_BUDGET_EXHAUSTED")
+        self.assertEqual(len(requests), 1)
+
+    def test_length_finish_is_reported_as_truncated(self):
+        outcome, _, _ = self.run_script([{"text": ["前半段"], "finish": "length"}])
+        self.assertEqual(outcome.error, "MODEL_STREAM_OUTPUT_TRUNCATED")
+
+    def test_cancel_stops_a_streaming_call(self):
+        cancel = threading.Event()
+        recorder = Recorder()
+
+        def on_event(kind, data):
+            recorder(kind, data)
+            if kind == "delta":
+                cancel.set()
+        started = time.monotonic()
+        outcome, _, _ = self.run_script([{"slow": 10}], cancel=cancel, on_event=on_event)
+        self.assertEqual(outcome.error, "CANCELLED")
+        self.assertLess(time.monotonic() - started, 6)
+
+
+class PatchTests(unittest.TestCase):
+    def test_missing_handshake_means_budget_plugin_not_mounted(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            with self.assertRaises(RuntimeError):
+                dsh_patch.read_budget_stop(Path(run_dir))
+
+    def test_provider_rejects_credentials_and_reserved_key_names(self):
+        for url in ("https://user:pw@h/v1", "https://h/api", "ftp://h/v1"):
+            with self.assertRaises(ValueError):
+                dsh_patch.Provider("p", url, "KEY")
+        for name in ("DSH_KEY", "OLLAMA_PLACEHOLDER_KEY", "lower"):
+            with self.assertRaises(ValueError):
+                dsh_patch.Provider("p", "https://h/v1", name)
+
+    @unittest.skipUnless(HAVE_DSH, "deepseek-harness runtime is not installed")
+    def test_dsh_official_telemetry_is_disabled(self):
+        import deepseek_harness
+        seen = {}
+
+        class Capture:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+                raise RuntimeError("captured")
+        original = getattr(deepseek_harness, "DeepSeekHarness", None)
+        deepseek_harness.DeepSeekHarness = Capture
+        os.environ[KEY_ENV] = "fake-key-0123456789"
+        try:
+            with tempfile.TemporaryDirectory() as state:
+                with self.assertRaises(RuntimeError):
+                    run_once("q", dsh_settings("http://127.0.0.1:1", state), lambda *_: None)
+        finally:
+            deepseek_harness.DeepSeekHarness = original
+        self.assertEqual(seen["env"]["DSH_TELEMETRY_DISABLED"], "1")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not on PATH")
+    def test_budget_plugin_unit_tests(self):
+        result = subprocess.run([shutil.which("node"), "--test", "sandbox/tests/test_model_budget.mjs"], cwd=ROOT,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout[-4000:] + result.stderr[-2000:])
+
+
+if __name__ == "__main__":
+    unittest.main()

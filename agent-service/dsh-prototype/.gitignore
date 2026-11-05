@@ -1,47 +1,16 @@
 # 本机环境、私有配置和生成文件
 .venv/
 .venv310/
-.runtime/
 __pycache__/
 *.py[cod]
 .env
 .env.*
 !.env.example
-/config.json
-/config/*.local.json
-/data/
-/sandbox/results/
-/work/
-/references/
-/dashboard/*
-!/dashboard/task-memory-preview.png
-!/dashboard/lifecycle-preview.png
-/development/latest-tests.json
-/development/*-snapshot.json
-*.db
-*.db-*
-*.sqlite
-*.sqlite3
-*.sqlite3-*
 *.log
 *.jsonl
 *.pem
 *.key
 id_rsa*
 id_ed25519*
-
-# 前端依赖与构建产物
-management_frontend/node_modules/
-management_frontend/.next/
-management_frontend/*.tsbuildinfo
-node-*.tar.xz
-frontend-linux.tgz
 .DS_Store
 Thumbs.db
-
-# 私有教材不提交；来源元数据与读取代码仍保留。
-/inputs/
-/materials/
-
-# 隔离测试身份、令牌和持久库仅在本机。
-/.isolated/

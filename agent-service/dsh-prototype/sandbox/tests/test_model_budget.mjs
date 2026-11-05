@@ -1,71 +1,137 @@
-/** 直接驱动正式公开插件，不经过pre-step，验证辅助调用也不能漏计。 */
+/** 直接驱动预算插件的 llm/stream 钩子：约束、停止原因和转发行。运行：node --test sandbox/tests/test_model_budget.mjs */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,rmSync,readFileSync} from 'node:fs';
-import {tmpdir} from 'node:os';
-import {join} from 'node:path';
-import {apply} from '../../dsh_tutor/plugins/model_budget.mjs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { apply } from '../../dsh_tutor/plugins/model_budget.mjs';
 
-function fixture(extra={}) {
- const dir=mkdtempSync(join(tmpdir(),'tutor-guard-'));const handlers={};
- const limits={max_model_calls:2,max_total_output_tokens:1024,max_input_estimated_tokens_per_call:6000,
-  max_total_input_estimated_tokens:24000,context_headroom_tokens:512,max_request_bytes:65536,
-  max_output_bytes:32768,max_runtime_events:128,...extra};
- apply({on:(name,fn)=>{handlers[name]=fn;}},{limits,provider:'local',model:'model',maxTokens:512,contextWindow:8192,
-  deadlineUnix:Date.now()/1000+20,metricsPath:join(dir,'metrics.json'),progressPath:join(dir,'events.jsonl')});
- return {handlers,dir,metrics:()=>JSON.parse(readFileSync(join(dir,'metrics.json'))),close:()=>rmSync(dir,{recursive:true})};
+function fixture(extra = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'tutor-budget-'));
+  const handlers = {};
+  apply({ on: (name, fn) => { handlers[name] = fn; } }, {
+    provider: 'p', model: 'm', maxModelCalls: 2, maxTokens: 512, maxOutputBytes: 1024,
+    deadlineUnix: Date.now() / 1000 + 20, allowedTools: ['mcp__aivirteach_tools__get_vm_status'],
+    cancelPath: join(dir, 'cancel.request'), budgetPath: join(dir, 'budget.json'), streamPath: join(dir, 'stream.jsonl'),
+    ...extra,
+  });
+  return {
+    dir,
+    stream: (options, next) => handlers['llm/stream'](options, next),
+    stop: () => JSON.parse(readFileSync(join(dir, 'budget.json'))).budget_stop,
+    rows: () => existsSync(join(dir, 'stream.jsonl'))
+      ? readFileSync(join(dir, 'stream.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [],
+    close: () => rmSync(dir, { recursive: true }),
+  };
 }
-const request=()=>Object.freeze({provider:'local',model:'model',maxTokens:512,messages:[{role:'user',content:[{type:'text',text:'hello'}]}]});
-async function consume(stream){for await(const ignored of stream){}}
-async function* success(){yield {type:'text-delta',index:0,text:'ok'};yield {type:'finish',reason:{kind:'stop'}};}
-test('direct auxiliary and retry attempts consume the same request budget',async()=>{
- const f=fixture();let calls=0;
- try{
-  for(let i=0;i<2;i++) await consume(f.handlers['llm/stream'](request(),()=>{calls++;return success();}));
-  await assert.rejects(consume(f.handlers['llm/stream'](request(),()=>{calls++;return success();})),/model_calls/);
-  assert.equal(calls,2);assert.equal(f.metrics().model_calls,2);assert.equal(f.metrics().unconfirmed_calls,0);
- }finally{f.close();}
-});
-test('failed provider attempt is not refunded',async()=>{
- const f=fixture({max_model_calls:1});
- try{await assert.rejects(consume(f.handlers['llm/stream'](request(),async function*(){throw Error('fake_disconnect');})),/fake_disconnect/);
-  await assert.rejects(consume(f.handlers['llm/stream'](request(),success)),/model_calls/);
-  assert.equal(f.metrics().unconfirmed_calls,1);
- }finally{f.close();}
-});
-test('different provider route is rejected without invoking it',async()=>{
- const f=fixture();let called=false;
- try{await assert.rejects(consume(f.handlers['llm/stream']({...request(),provider:'other'},()=>{called=true;return success();})),/route/);assert.equal(called,false);}finally{f.close();}
-});
-test('output reservations reject a hidden summary requesting a larger cap',async()=>{
- const f=fixture();let called=false;
- try{await assert.rejects(consume(f.handlers['llm/stream']({...request(),maxTokens:65536},()=>{called=true;return success();})),/missing_output_cap/);assert.equal(called,false);}finally{f.close();}
-});
-test('request and per-request budgets are independent across instances',async()=>{
- const a=fixture({max_model_calls:1}),b=fixture({max_model_calls:1});
- try{await consume(a.handlers['llm/stream'](request(),success));await consume(b.handlers['llm/stream'](request(),success));assert.equal(a.metrics().model_calls,1);assert.equal(b.metrics().model_calls,1);}finally{a.close();b.close();}
+const request = (extra = {}) => ({ provider: 'p', model: 'm', maxTokens: 512, tools: [], ...extra });
+async function consume(stream) { for await (const ignored of stream); }
+async function* reply() {
+  yield { type: 'block-start', blockType: 'text' };
+  yield { type: 'text-delta', text: '你好' };
+  yield { type: 'usage', usage: { inputTokens: 40, outputTokens: 2, totalTokens: 122, cacheReadTokens: 80 } };
+  yield { type: 'finish', reason: { kind: 'stop' } };
+}
+
+test('handshake file is written when the plugin mounts', () => {
+  const f = fixture();
+  try { assert.equal(f.stop(), null); } finally { f.close(); }
 });
 
-test('an unexpected tool schema is blocked before provider I/O',async()=>{
- const f=fixture();let called=false;
- try{await assert.rejects(consume(f.handlers['llm/stream']({...request(),tools:[{name:'arbitrary_shell'}]},()=>{called=true;return success();})),/tool_set/);assert.equal(called,false);}finally{f.close();}
-});
-test('empty streaming chunks cannot bypass finite buffers',async()=>{
- const f=fixture({max_stream_chunks:16});
- try{await assert.rejects(consume(f.handlers['llm/stream'](request(),async function*(){for(let i=0;i<20;i++)yield {type:'text-delta',index:0,text:''};})),/stream_chunks/);assert.equal(f.metrics().unconfirmed_calls,1);}finally{f.close();}
+test('relays start, block, delta, usage and finish with call number and timestamp', async () => {
+  const f = fixture();
+  try {
+    await consume(f.stream(request(), reply));
+    const rows = f.rows();
+    assert.deepEqual(rows.map(({ t, ...rest }) => rest), [
+      { call: 1, start: true }, { call: 1, block: 'text' }, { call: 1, delta: '你好' },
+      { call: 1, usage: { inputTokens: 40, outputTokens: 2, totalTokens: 122, cacheReadTokens: 80 } },
+      { call: 1, finish: 'stop' },
+    ]);
+    assert.ok(rows.every((row, i) => Number.isInteger(row.t) && (i === 0 || row.t >= rows[i - 1].t)));
+  } finally { f.close(); }
 });
 
-test('synthetic error finish must not release unknown remote work',async()=>{
- const f=fixture({max_model_calls:1});
- try{
-  await consume(f.handlers['llm/stream'](request(),async function*(){yield {type:'finish',reason:{kind:'error',failure:{code:'TRANSPORT'}}};}));
-  assert.equal(f.metrics().unconfirmed_calls,1);
-  await assert.rejects(consume(f.handlers['llm/stream'](request(),success)),/model_calls/);
-  assert.equal(f.metrics().unconfirmed_calls,1);
- }finally{f.close();}
+test('model call limit stops before the provider is called', async () => {
+  const f = fixture();
+  let called = 0;
+  try {
+    for (let i = 0; i < 2; i++) await consume(f.stream(request(), () => { called++; return reply(); }));
+    await assert.rejects(consume(f.stream(request(), () => { called++; return reply(); })), /model_calls/);
+    assert.equal(called, 2);
+    assert.equal(f.stop(), 'model_calls');
+  } finally { f.close(); }
 });
-test('unknown finish and missing reason stay unconfirmed',async()=>{
- for(const reason of [undefined,{kind:'aborted'},{kind:'other'}]){
-  const f=fixture();try{await consume(f.handlers['llm/stream'](request(),async function*(){yield {type:'finish',reason};}));assert.equal(f.metrics().unconfirmed_calls,1);}finally{f.close();}
- }
+
+for (const [label, options, code] of [
+  ['another provider', request({ provider: 'other' }), 'route'],
+  ['another model', request({ model: 'other' }), 'route'],
+  ['a larger output cap', request({ maxTokens: 4096 }), 'output_cap'],
+  ['a missing output cap', request({ maxTokens: undefined }), 'output_cap'],
+  ['an unapproved tool', request({ tools: [{ name: 'shell' }] }), 'tool_set'],
+]) {
+  test(`${label} is rejected without calling the provider`, async () => {
+    const f = fixture();
+    let called = false;
+    try {
+      await assert.rejects(consume(f.stream(options, () => { called = true; return reply(); })), new RegExp(code));
+      assert.equal(called, false);
+      assert.equal(f.stop(), code);
+    } finally { f.close(); }
+  });
+}
+
+test('an approved tool is allowed', async () => {
+  const f = fixture();
+  try { await consume(f.stream(request({ tools: [{ name: 'mcp__aivirteach_tools__get_vm_status' }] }), reply)); }
+  finally { f.close(); }
+});
+
+test('deadline stops new calls', async () => {
+  const f = fixture({ deadlineUnix: Date.now() / 1000 - 1 });
+  try {
+    await assert.rejects(consume(f.stream(request(), reply)), /deadline/);
+    assert.equal(f.stop(), 'deadline');
+  } finally { f.close(); }
+});
+
+test('output byte limit counts text and tool arguments across calls', async () => {
+  const f = fixture({ maxOutputBytes: 10 });
+  try {
+    await assert.rejects(consume(f.stream(request(), async function* () {
+      yield { type: 'tool-call-delta', argumentsDelta: '{"a":1}' };
+      yield { type: 'text-delta', text: '超过上限' };
+    })), /output_bytes/);
+    assert.equal(f.stop(), 'output_bytes');
+    assert.deepEqual(f.rows().map((row) => row.error).filter(Boolean), ['budget']);
+  } finally { f.close(); }
+});
+
+test('cancel file stops before a call and during a stream', async () => {
+  const f = fixture();
+  try {
+    await assert.rejects(consume(f.stream(request(), async function* () {
+      for (let i = 0; i < 64; i++) {
+        if (i === 10) writeFileSync(join(f.dir, 'cancel.request'), '');
+        yield { type: 'text-delta', text: 'x' };
+      }
+    })), /tutor_cancelled/);
+    assert.deepEqual(f.rows().map((row) => row.error).filter(Boolean), ['cancelled']);
+    await assert.rejects(consume(f.stream(request(), reply)), /tutor_cancelled/);
+    assert.equal(f.stop(), null);
+  } finally { f.close(); }
+});
+
+test('provider failure is relayed as a stable code without its text', async () => {
+  const f = fixture();
+  try {
+    await assert.rejects(consume(f.stream(request(), async function* () { throw new Error('secret upstream text'); })));
+    const text = readFileSync(join(f.dir, 'stream.jsonl'), 'utf8');
+    assert.ok(text.includes('"stream_error"'));
+    assert.ok(!text.includes('secret'));
+  } finally { f.close(); }
+});
+
+test('invalid configuration refuses to mount', () => {
+  assert.throws(() => apply({ on() {} }, { maxModelCalls: 1, maxTokens: 1, maxOutputBytes: 1 }), /tutor_budget_config/);
 });

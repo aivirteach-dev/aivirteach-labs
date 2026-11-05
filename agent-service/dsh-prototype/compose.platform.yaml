@@ -7,7 +7,6 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
-      target: platform
     image: dsh-platform-agent:${DSH_PLATFORM_IMAGE_TAG:-local}
     restart: unless-stopped
     init: true
@@ -17,7 +16,7 @@ services:
     read_only: true
     tmpfs:
       - "/tmp:size=32m,mode=1777,noexec,nosuid,nodev"
-      # DSH 运行时需要可执行的临时目录（与 compose.isolated.yaml 相同的做法）。
+      # DSH 运行时需要可执行的临时目录。
       - "/native-cache:size=64m,mode=0700,uid=1000,gid=1000,exec,nosuid,nodev"
     pids_limit: 128
     mem_limit: ${DSH_AGENT_MEM_LIMIT:-2g}

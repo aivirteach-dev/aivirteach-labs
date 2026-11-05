@@ -83,7 +83,7 @@ class ToolBridge:
         self.cache: dict = {}
 
     def _write(self, row: dict) -> None:
-        line = (json.dumps(row, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+        line = (json.dumps({"t": int(time.time() * 1000), **row}, ensure_ascii=False, default=str) + "\n").encode("utf-8")
         fd = os.open(self.ctx.events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, line)
