@@ -1,0 +1,63 @@
+# 监控（Phoenix）。叠加在 compose.platform.yaml 上，与 DSH Agent 同一个 compose 项目运行：
+#   docker compose -f compose.platform.yaml -f compose.monitoring.yaml \
+#     --env-file ../../config.env --env-file .env.monitoring up -d --build
+# 变量见 deploy/monitoring.env.example，部署和检查步骤见 docs/monitoring.md。
+# Phoenix 的界面和接收地址只发布在服务器本机 127.0.0.1，从自己的电脑经 SSH 隧道访问。
+services:
+  phoenix:
+    # 20.16.0 已在本地验证；升级前先在测试环境重新验证。digest 是多架构索引（amd64、arm64）。
+    image: arizephoenix/phoenix:version-20.16.0-nonroot@sha256:e4a41a209b07289581a5d48167a11051c12704ac48983056fe0989b6f13b467a
+    restart: unless-stopped
+    init: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - "/tmp:size=64m,mode=1777,noexec,nosuid,nodev"
+    pids_limit: 256
+    mem_limit: ${PHOENIX_MEM_LIMIT:-1g}
+    memswap_limit: ${PHOENIX_MEM_LIMIT:-1g}
+    environment:
+      # 数据（SQLite）放在命名卷里；卷挂在镜像自带、属于 nonroot 用户的 /home/nonroot，首次创建时继承它的权限。
+      PHOENIX_WORKING_DIR: /home/nonroot/.phoenix
+      PHOENIX_PORT: "6006"
+      # 登录：界面、REST、OTLP 接收都要求登录或 API key。管理员账号为 admin@localhost。
+      PHOENIX_ENABLE_AUTH: "true"
+      PHOENIX_SECRET: "${PHOENIX_SECRET:?Set PHOENIX_SECRET in .env.monitoring}"
+      PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD: "${PHOENIX_ADMIN_INITIAL_PASSWORD:?Set PHOENIX_ADMIN_INITIAL_PASSWORD in .env.monitoring}"
+      PHOENIX_ENABLE_STRONG_PASSWORD_POLICY: "true"
+      PHOENIX_USE_SECURE_COOKIES: "false"  # 经 SSH 隧道用 http://localhost 访问；改为 HTTPS 访问时设为 true
+      # 保留期：超过天数的 trace 每周日 0 点清理（所以最长约多保留 7 天）；磁盘用量到 90% 停止写入。
+      PHOENIX_DEFAULT_RETENTION_POLICY_DAYS: "${PHOENIX_RETENTION_DAYS:-30}"
+      PHOENIX_DATABASE_ALLOCATED_STORAGE_CAPACITY_GIBIBYTES: "${PHOENIX_STORAGE_GIB:-10}"
+      PHOENIX_DATABASE_USAGE_INSERTION_BLOCKING_THRESHOLD_PERCENTAGE: "90"
+      # 关闭 Phoenix 的统计像素、外部字体，以及用不到的 AI 助手（含服务器端 Shell）、MCP 接口和代码沙箱。
+      PHOENIX_TELEMETRY_ENABLED: "false"
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+      PHOENIX_DISABLE_AGENT_ASSISTANT: "true"
+      PHOENIX_AGENTS_DISABLE_BASH: "true"
+      PHOENIX_AGENTS_DISABLE_WEB_ACCESS: "true"
+      PHOENIX_AGENTS_DISABLE_GITHUB: "true"
+      PHOENIX_ENABLE_MCP_SERVER: "false"
+      PHOENIX_ALLOWED_SANDBOX_PROVIDERS: "NONE"
+    ports:
+      # 只发布界面/HTTP 接收端口，且只在本机；gRPC 4317 不发布，Agent 走容器网络的 HTTP。
+      - "127.0.0.1:${PHOENIX_UI_PORT:-6006}:6006"
+    volumes:
+      - "phoenix-data:/home/nonroot"
+    healthcheck:
+      test: ["CMD", "/usr/bin/python3.13", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6006/healthz', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  dsh-agent:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://phoenix:6006"
+      # 首次部署时还没有 API key：先留空（监控数据被拒收，Agent 照常工作），在 Phoenix 里创建后填入再重启 Agent。
+      OTEL_EXPORTER_OTLP_HEADERS: "authorization=Bearer ${PHOENIX_API_KEY:-}"
+
+volumes:
+  phoenix-data:

@@ -44,8 +44,57 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:6006 ./start_platform.sh
 
 Phoenix 不内置 DeepSeek 的价格：要看费用，在 Settings → Models 里按当前价目添加模型名和每百万 token 的输入、缓存命中输入、输出价格。
 
-## 服务器部署（监控阶段 3）
+## 服务器部署
 
-- Phoenix 单独一个容器，只监听本机或内网，开启登录（`PHOENIX_ENABLE_AUTH=true`），设置保留期（`PHOENIX_DEFAULT_RETENTION_POLICY_DAYS=30`）。
-- Agent 的 `OTEL_EXPORTER_OTLP_ENDPOINT` 指向它，`OTEL_EXPORTER_OTLP_HEADERS` 填 Phoenix 的 API key。
-- 告警（超时率、失败率、延迟）在监控阶段 4 通过 OpenTelemetry Collector 接入。
+`compose.monitoring.yaml` 叠加在 `compose.platform.yaml` 上，Phoenix 和 DSH Agent 在同一个 compose 项目里，Agent 经容器网络把数据发给 `http://phoenix:6006`。
+
+### Phoenix 的安全设置
+
+| 设置 | 作用 |
+|---|---|
+| 端口只发布在 `127.0.0.1:6006` | 公网和内网都访问不到，只能从服务器本机或 SSH 隧道访问；gRPC 4317 不发布 |
+| `PHOENIX_ENABLE_AUTH=true` | 界面要登录；REST 读取和 OTLP 写入都要 API key，否则返回 401 |
+| 强密码策略 | 至少 12 位，含大小写、数字和特殊字符 |
+| 保留 30 天 | 超过 30 天的 trace 每周日 0 点清理，所以最长约保留 37 天 |
+| 磁盘上限 10 GiB，用到 90% 停止写入 | 防止监控数据写满磁盘；删除不受影响 |
+| 关闭统计像素、外部字体 | Phoenix 不向外部发送任何东西 |
+| 关闭 AI 助手（含服务器端 Shell、联网、GitHub）、MCP 接口、代码沙箱 | 这些功能用不到，关掉减少攻击面 |
+| 非 root（uid 65532）、只读根文件系统、去掉全部 capabilities、`no-new-privileges`、内存 1 GiB、进程数 256 | 容器加固，与 Agent 容器同样的做法 |
+| 镜像固定版本和 digest | `version-20.16.0-nonroot`，与本地验证的版本相同 |
+
+### 第一次部署
+
+在服务器上 `agent-service/dsh-prototype/` 目录里：
+
+```bash
+# 1. 准备密钥文件（不提交，权限 600）
+cp deploy/monitoring.env.example .env.monitoring && chmod 600 .env.monitoring
+#    填 PHOENIX_SECRET（openssl rand -hex 32）和 PHOENIX_ADMIN_INITIAL_PASSWORD；PHOENIX_API_KEY 先留空
+
+# 2. 启动 Agent 和 Phoenix
+docker compose -f compose.platform.yaml -f compose.monitoring.yaml \
+  --env-file ../../config.env --env-file .env.monitoring up -d --build
+
+# 3. 在自己的电脑上开 SSH 隧道（只转发到服务器本机地址），浏览器打开 http://localhost:6006
+ssh -N -L 127.0.0.1:6006:127.0.0.1:6006 用户@服务器
+
+# 4. 用 admin@localhost 和初始密码登录 → Settings → API Keys → System Keys，新建 dsh-agent，
+#    把显示的 key 填进 .env.monitoring 的 PHOENIX_API_KEY，然后只重启 Agent：
+docker compose -f compose.platform.yaml -f compose.monitoring.yaml \
+  --env-file ../../config.env --env-file .env.monitoring up -d dsh-agent
+
+# 5. 检查
+deploy/check_monitoring.sh
+```
+
+第 4 步之前 Agent 的监控数据会被 Phoenix 拒收（日志里有 `Failed to export spans batch code: 401`），但回答学生不受影响。
+
+`check_monitoring.sh` 检查：容器健康、非 root、6006 只在 127.0.0.1、4317 没发布、不带 key 写入和读取都被拒绝、保留期已设置、Agent 能连到 Phoenix 且 key 有效、没有开启问答原文记录。只读，不打印密钥。
+
+### 部署后
+
+- 首次登录后在 Settings → Models 添加 DeepSeek 的价格，才能看到费用。
+- 改了 `PHOENIX_ADMIN_INITIAL_PASSWORD` 不会影响已有的管理员；改密码在界面里做。
+- 数据在命名卷 `dsh-platform_phoenix-data` 里。删除它会清空所有监控数据。
+- 升级 Phoenix：先在测试环境验证新版本，再改 `compose.monitoring.yaml` 里的版本和 digest。
+- 告警（超时率、失败率、延迟）在监控阶段 4 接入。

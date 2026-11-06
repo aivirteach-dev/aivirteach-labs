@@ -24,6 +24,7 @@
 
 - 宿主机：`./start_platform.sh`，读取与 main 相同的 `agent-service/config/agent.env`（可用 `AIVIRTEACH_AGENT_ENV_FILE` 指定）。
 - 容器：`docker compose -f compose.platform.yaml --env-file ../../config.env up -d --build`。
+- 容器加监控（Phoenix）：再叠加 `-f compose.monitoring.yaml --env-file .env.monitoring`，步骤见 [docs/monitoring.md](docs/monitoring.md#服务器部署)。
 
 两种方式都占用 8770，与 main 的 agent-service 二选一。用真实 Gateway 验收见 [docs/platform-gateway-test.md](docs/platform-gateway-test.md)。
 
@@ -60,4 +61,4 @@ python3 -m venv .venv
 - `diagnosis`、`course_alignment`、`suggested_actions` 留空：回答一次生成并逐段推送（main 先单独生成结构化 JSON）。Server 只要求这些字段存在，Client 只显示 `answer`。
 - 回答超过输出上限时保留已生成内容，标记 `partial` 和 `MODEL_STREAM_OUTPUT_TRUNCATED`。
 - 尚未在真实 Gateway / 真实 VM 上验收；镜像未在 Docker 中实际构建。
-- 监控已能发送到 Phoenix 并在本机验证；服务器上的 Phoenix 部署和告警是后续阶段。
+- 监控：Phoenix 的部署文件已在本机用相同设置验证，尚未在服务器的 Docker 里实际运行；告警是后续阶段。
