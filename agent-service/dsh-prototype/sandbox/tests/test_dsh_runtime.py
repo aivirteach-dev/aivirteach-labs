@@ -88,12 +88,20 @@ class DshRuntimeTests(unittest.TestCase):
         self.assertFalse(requests[0].get("tools"))
         self.assertEqual(requests[0].get("reasoning_effort"), "none")
 
+    def test_rules_go_to_the_system_message_and_data_to_the_user_message(self):
+        _, _, requests = self.run_script([{"text": ["好"]}], system_prompt="助教规则：只读检查。")
+        messages = requests[0]["messages"]
+        self.assertEqual(messages[0], {"role": "system", "content": "助教规则：只读检查。"})
+        self.assertEqual([m["content"] for m in messages if m["role"] == "user"][0], "问题")
+        self.assertEqual(sum(m["role"] == "system" for m in messages), 1)
+
     def test_tool_call_reaches_gateway_and_is_timed_between_model_calls(self):
         with fake_model.serve(fake_gateway.app) as gateway:
             outcome, events, requests = self.run_script(
                 [{"tool": "get_vm_status"}, {"text": ["虚拟机在运行 [obs-001]"]}], tools=lambda _: self.tools(gateway))
         self.assertIsNone(outcome.error)
-        self.assertEqual([e["id"] for e in outcome.evidence], ["obs-001"])
+        self.assertEqual([(e["id"], e["summary"]) for e in outcome.evidence],
+                         [("obs-001", "VM status and reported IPv4 addresses were collected.")])
         self.assertEqual([(t["tool"], t["status"]) for t in outcome.tool_trace], [("get_vm_status", "ok")])
         self.assertEqual([d["name"] for d in events.kinds("tool_event")], ["tool_started", "tool_finished"])
         self.assertEqual(outcome.tool_events, events.kinds("tool_event"))
@@ -176,6 +184,14 @@ class PatchTests(unittest.TestCase):
         finally:
             deepseek_harness.DeepSeekHarness = original
         self.assertEqual(seen["env"]["DSH_TELEMETRY_DISABLED"], "1")
+
+    def test_fake_gateway_matches_real_gateway_wording(self):
+        source = ROOT.parent.parent / "diagnostic-gateway" / "diagnostic_gateway.py"
+        if not source.exists():
+            self.skipTest("diagnostic-gateway is not in this checkout")
+        text = source.read_text(encoding="utf-8")
+        for tool in ("get_vm_status", "get_guest_agent_status"):
+            self.assertIn(f'return "{fake_gateway.CANNED[tool][0]}"', text, tool)
 
     @unittest.skipUnless(shutil.which("node"), "node is not on PATH")
     def test_budget_plugin_unit_tests(self):

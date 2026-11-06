@@ -12,7 +12,7 @@
 
 ## 一次请求怎么跑
 
-1. `platform_app.py`：鉴权、排队（并发上限）、组提示词，在线程里调用 `run_once`，把过程事件转成 SSE。
+1. `platform_app.py`：鉴权、排队（并发上限）、组提示词（助教规则作为系统消息，经 DSH 的 `DSH_SYSTEM_PROMPT`；课程资料、历史和学生问题作为用户消息），在线程里调用 `run_once`，把过程事件转成 SSE。
 2. `platform_runtime.py`：建临时运行目录，启动一个 DSH 会话，读取事件文件，结束后删除目录。
 3. `dsh_patch.py`：生成本次请求的 DSH 补丁——模型提供方、预算插件、工具桥。DSH 自带的文件、Shell、摘要、重试等插件在 `dsh-base.patch.yml` 里关闭。
 4. `plugins/model_budget.mjs`（预算插件）：每次模型调用前检查次数、单次输出上限、工具集、总时限、取消；把文字片段、用量、结束原因写进事件文件。

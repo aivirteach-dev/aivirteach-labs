@@ -44,6 +44,8 @@ class DshSettings:
     state_dir: Path
     reasoning_off: bool = True
     max_model_calls: int = 5  # main：最多 4 轮推理 + 1 次收尾
+    # 助教规则，作为模型看到的系统消息（经 DSH 的 DSH_SYSTEM_PROMPT）；为空时是 DSH 默认的“软件工程师助手”。
+    system_prompt: str = ""
 
     def provider(self) -> Provider:
         if self.provider_kind == "ollama":
@@ -188,6 +190,8 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
         no_proxy = ",".join(sorted(h for h in hosts if h))
         # DSH_TELEMETRY_DISABLED：DSH 官方遥测会把会话发往 DeepSeek 的服务器，在这里硬性关闭。
         env = {**provider.environment(), "NO_PROXY": no_proxy, "no_proxy": no_proxy, "DSH_TELEMETRY_DISABLED": "1"}
+        if settings.system_prompt:
+            env["DSH_SYSTEM_PROMPT"] = settings.system_prompt
         tail = _StreamTail(stream_path, cancel_path, on_event, cancel)
         tail.start()
         answer, finish_reason, failure = "", None, None

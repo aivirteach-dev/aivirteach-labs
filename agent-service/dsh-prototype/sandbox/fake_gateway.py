@@ -19,8 +19,12 @@ bearer = HTTPBearer(auto_error=False)
 
 # 模拟一个“n8n 容器已退出、5678 没在监听”的实验环境。
 CANNED: dict[str, tuple[str, Any]] = {
-    "get_vm_status": ("VM is running.", {"state": "running", "vcpus": 2, "memory_mib": 4096}),
-    "get_guest_agent_status": ("QEMU guest agent responded.", {"responding": True}),
+    # 前两个的摘要必须和真实 Gateway 一字不差：Server 的“诊断详情”只显示这几句原文。
+    "get_vm_status": ("VM status and reported IPv4 addresses were collected.", {
+        "dominfo": "Id:             3\nName:           lab-001\nState:          running\n"
+                   "CPU(s):         2\nMax memory:     4194304 KiB\nUsed memory:    4194304 KiB\n",
+        "ipv4_addresses": ["192.168.122.57"]}),
+    "get_guest_agent_status": ("QEMU guest agent responded to guest-ping.", {"available": True}),
     "get_guest_service_status": ("docker.service is active (running).", {"ActiveState": "active", "SubState": "running"}),
     "list_guest_containers": ("1 container: n8n (exited).", [{"name": "n8n", "state": "exited", "status": "Exited (1) 3 minutes ago"}]),
     "get_guest_container_status": ("Container n8n exited with code 1.", {"name": "n8n", "state": "exited", "exit_code": 1}),
