@@ -81,6 +81,49 @@ def create_app(script: list) -> FastAPI:
 
 
 @contextmanager
+def dropping_proxy(target_url: str, drop: int = 1) -> Iterator[str]:
+    """TCP 代理：前 drop 个连接一建立就关闭（模拟网络中途切断连接），之后的连接原样转发到 target_url。"""
+    host, port = target_url.rsplit("//", 1)[1].split(":")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    state = {"seen": 0}
+
+    def pipe(source, target):
+        try:
+            while data := source.recv(65536):
+                target.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sock in (source, target):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def accept():
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            state["seen"] += 1
+            if state["seen"] <= drop:
+                client.close()
+                continue
+            upstream = socket.create_connection((host, int(port)))
+            threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+            threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        listener.close()
+
+
+@contextmanager
 def serve(app: FastAPI) -> Iterator[str]:
     """在后台线程启动 app，返回 http://127.0.0.1:<端口>。"""
     import uvicorn

@@ -20,7 +20,7 @@
    提示词和校验在 `platform_assessment.py`（解析和兜底照抄 main，测试对比两边结果）；每个阶段的规则作为系统消息（经 DSH 的 `DSH_SYSTEM_PROMPT`），数据作为用户消息。
 2. `platform_runtime.py`：运行一个阶段：建临时运行目录，启动一个 DSH 会话，读取事件文件，结束后删除目录。
 3. `dsh_patch.py`：生成本次请求的 DSH 补丁——模型提供方、预算插件、工具桥。DSH 自带的文件、Shell、摘要、重试等插件在 `dsh-base.patch.yml` 里关闭。
-4. `plugins/model_budget.mjs`（预算插件）：每次模型调用前检查次数、单次输出上限、工具集、总时限、取消；把文字片段、用量、结束原因写进事件文件。
+4. `plugins/model_budget.mjs`（预算插件）：每次模型调用前检查次数、单次输出上限、工具集、总时限、取消；把文字片段、用量、结束原因写进事件文件。连接被切断或请求超时、且模型还没输出任何内容时，同一次调用重试一次（不会出现重复内容，也不算新的模型调用）。
 5. `platform_mcp.py`（工具桥，MCP stdio）：按 Server 给的 `diagnostic_scope` 校验后调用 Gateway `POST /v1/diagnostics/{lab_id}/tools/{tool}`，写证据和调用记录。Server 不传范围时，与 main 一样只有 `get_vm_status`、`get_guest_agent_status`。
 
 事件文件每行带毫秒时间戳 `t`；`RunOutcome.calls` 给出每次模型调用的开始、首字、结束时间、结束原因和用量，监控据此按 OpenTelemetry 发送到 Phoenix，见 [docs/monitoring.md](docs/monitoring.md)。DSH 官方遥测会把会话发往 DeepSeek，已用 `DSH_TELEMETRY_DISABLED=1` 关闭。

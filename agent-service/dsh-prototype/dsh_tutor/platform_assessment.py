@@ -28,6 +28,7 @@ _SHARED_RULES = """- 以用户消息里的当前课时作为预期行为的依�
 
 _JSON_RULES = """最后一条消息只输出一个 JSON 对象，不要用 Markdown 代码块，也不要写给学生的回答。字段正好是：
 diagnosis、course_alignment、evidence_ids、suggested_actions、limitations。
+不要添加任何其他字段（顶层和各字段内部都不要）；没有内容时用空字符串或空数组。
 - diagnosis：summary（字符串）、probable_causes（字符串数组）、confidence（low、medium 或 high）。
 - course_alignment：expected 和 observed（都是字符串数组）。
 - evidence_ids：只能填工具结果里返回的观察编号（如 obs-001）。

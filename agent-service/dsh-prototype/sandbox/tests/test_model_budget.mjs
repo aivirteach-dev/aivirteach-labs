@@ -132,6 +132,52 @@ test('provider failure is relayed as a stable code without its text', async () =
   } finally { f.close(); }
 });
 
+const dropped = (code) => async function* () {
+  yield { type: 'usage', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
+  yield { type: 'finish', reason: { kind: 'error', failure: { message: 'Connection error.', code } } };
+};
+async function collect(stream) { const out = []; for await (const chunk of stream) out.push(chunk); return out; }
+
+test('a connection error before any output is retried once within the same call', async () => {
+  const f = fixture({ maxModelCalls: 1 });
+  let attempts = 0;
+  try {
+    const out = await collect(f.stream(request(), () => (++attempts === 1 ? dropped('TRANSPORT')() : reply())));
+    assert.equal(attempts, 2);
+    assert.deepEqual(out.map((c) => c.type), ['block-start', 'text-delta', 'usage', 'finish']);
+    assert.equal(out.at(-1).reason.kind, 'stop');
+    assert.deepEqual(f.rows().filter((r) => r.retry).map((r) => [r.call, r.retry]), [[1, 'TRANSPORT']]);
+    assert.equal(f.stop(), null);  // 重试不算新的模型调用
+  } finally { f.close(); }
+});
+
+test('a thrown timeout before any output is retried once', async () => {
+  const f = fixture();
+  let attempts = 0;
+  try {
+    await consume(f.stream(request(), () => (++attempts === 1
+      ? (async function* () { throw Object.assign(new Error('Request timed out.'), { code: 'TIMEOUT' }); })()
+      : reply())));
+    assert.equal(attempts, 2);
+  } finally { f.close(); }
+});
+
+test('no retry after output started, for other error codes, or a second time', async () => {
+  for (const [label, factory, expectedAttempts] of [
+    ['after output', () => async function* () { yield { type: 'text-delta', text: '半' }; yield* dropped('TRANSPORT')(); }, 1],
+    ['auth error', () => dropped('AUTH'), 1],
+    ['second failure', () => dropped('TRANSPORT'), 2],
+  ]) {
+    const f = fixture();
+    let attempts = 0;
+    try {
+      const out = await collect(f.stream(request(), () => { attempts++; return factory()(); }));
+      assert.equal(attempts, expectedAttempts, label);
+      assert.equal(out.at(-1).reason.kind, 'error', label);  // 失败原样交给 DSH
+    } finally { f.close(); }
+  }
+});
+
 test('invalid configuration refuses to mount', () => {
   assert.throws(() => apply({ on() {} }, { maxModelCalls: 1, maxTokens: 1, maxOutputBytes: 1 }), /tutor_budget_config/);
 });

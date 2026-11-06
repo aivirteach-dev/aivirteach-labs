@@ -118,6 +118,23 @@ class DshRuntimeTests(unittest.TestCase):
         self.assertEqual((outcome.error, outcome.budget_stop), ("MODEL_BUDGET_EXHAUSTED", "model_calls"))
         self.assertEqual(len(requests), 1)
 
+    def test_dropped_connection_is_retried_once(self):
+        app = fake_model.create_app([{"text": ["重试后成功"]}])
+        with fake_model.serve(app) as url, fake_model.dropping_proxy(url, drop=1) as proxy:
+            outcome = run_once("问题", dsh_settings(proxy, self.state), Recorder())
+        self.assertEqual((outcome.answer, outcome.error), ("重试后成功", None))
+        [call] = outcome.calls
+        self.assertEqual((call.retries, call.finish), (1, "stop"))
+        self.assertEqual(len(app.state.requests), 1)  # 被切断的那次没有到达模型
+
+    def test_connection_dropped_twice_is_not_retried_again(self):
+        app = fake_model.create_app([{"text": ["不会到这里"]}])
+        with fake_model.serve(app) as url, fake_model.dropping_proxy(url, drop=5) as proxy:
+            outcome = run_once("问题", dsh_settings(proxy, self.state), Recorder())
+        [call] = outcome.calls
+        self.assertEqual((call.retries, call.finish, outcome.answer), (1, "error", ""))
+        self.assertEqual(len(app.state.requests), 0)
+
     def test_length_finish_is_reported_as_truncated(self):
         outcome, _, _ = self.run_script([{"text": ["前半段"], "finish": "length"}])
         self.assertEqual(outcome.error, "MODEL_STREAM_OUTPUT_TRUNCATED")

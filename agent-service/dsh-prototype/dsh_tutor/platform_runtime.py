@@ -65,6 +65,7 @@ class ModelCall:
     error: Optional[str] = None
     usage: Optional[dict] = None
     phase: str = ""  # assessment / finalization / answer，由 Diagnoser 填写
+    retries: int = 0  # 连接类错误后的重试次数（预算插件最多重试一次）
 
 
 @dataclass
@@ -138,6 +139,9 @@ class _StreamTail(threading.Thread):
             if record is not None:
                 record.end_ms, record.finish = t, row["finish"]
             self.on_event("finish", {"call": call, "t": t, "kind": row["finish"]})
+        elif isinstance(row.get("retry"), str):
+            if record is not None:
+                record.retries += 1
         elif isinstance(row.get("error"), str):
             if record is not None:
                 record.end_ms, record.error = t, row["error"]

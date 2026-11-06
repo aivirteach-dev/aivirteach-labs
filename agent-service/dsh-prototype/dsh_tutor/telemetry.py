@@ -197,6 +197,8 @@ class Telemetry:
                 span.set_attribute("aivirteach.time_to_first_token_ms", call.first_delta_ms - call.start_ms)
             if call.finish:
                 span.set_attribute("gen_ai.response.finish_reasons", [call.finish])
+            if getattr(call, "retries", 0):
+                span.set_attribute("aivirteach.retries", call.retries)
             if call.error or call.end_ms is None or call.finish in ERROR_FINISHES:
                 code = call.error or (call.finish if call.finish in ERROR_FINISHES else "not_finished")
                 span.set_attribute("error.type", code)
