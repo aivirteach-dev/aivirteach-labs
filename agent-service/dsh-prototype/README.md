@@ -12,8 +12,13 @@
 
 ## 一次请求怎么跑
 
-1. `platform_app.py`：鉴权、排队（并发上限）、组提示词（助教规则作为系统消息，经 DSH 的 `DSH_SYSTEM_PROMPT`；课程资料、历史和学生问题作为用户消息），在线程里调用 `run_once`，把过程事件转成 SSE。
-2. `platform_runtime.py`：建临时运行目录，启动一个 DSH 会话，读取事件文件，结束后删除目录。
+1. `platform_app.py`：鉴权、排队（并发上限），在工作线程里按 main 的流程依次运行各阶段，把过程事件转成 SSE：
+   - **评估**：DSH + 工具，模型查证后只输出结构化评估 JSON（诊断、课程对应、证据编号、建议、限制），不推送给学生；
+   - **收尾**：只在检查次数用完、还没给出评估时，不带工具再问一次；
+   - **校验**：JSON 结构和证据编号不合规就不写回答（`ASSESSMENT_INVALID`）；
+   - **回答**：另起一个不带工具的 DSH 会话，只根据校验过的评估写回答，逐段推送。
+   提示词和校验在 `platform_assessment.py`（解析和兜底照抄 main，测试对比两边结果）；每个阶段的规则作为系统消息（经 DSH 的 `DSH_SYSTEM_PROMPT`），数据作为用户消息。
+2. `platform_runtime.py`：运行一个阶段：建临时运行目录，启动一个 DSH 会话，读取事件文件，结束后删除目录。
 3. `dsh_patch.py`：生成本次请求的 DSH 补丁——模型提供方、预算插件、工具桥。DSH 自带的文件、Shell、摘要、重试等插件在 `dsh-base.patch.yml` 里关闭。
 4. `plugins/model_budget.mjs`（预算插件）：每次模型调用前检查次数、单次输出上限、工具集、总时限、取消；把文字片段、用量、结束原因写进事件文件。
 5. `platform_mcp.py`（工具桥，MCP stdio）：按 Server 给的 `diagnostic_scope` 校验后调用 Gateway `POST /v1/diagnostics/{lab_id}/tools/{tool}`，写证据和调用记录。Server 不传范围时，与 main 一样只有 `get_vm_status`、`get_guest_agent_status`。
@@ -59,7 +64,8 @@ python3 -m venv .venv
 
 ## 当前边界
 
-- `diagnosis`、`course_alignment`、`suggested_actions` 留空：回答一次生成并逐段推送（main 先单独生成结构化 JSON）。Server 只要求这些字段存在，Client 只显示 `answer`。
+- 每个请求至少 2 次 DSH 运行（评估、回答），比一次生成多约 3 秒、多约 40% token；学生在评估完成后才开始看到文字。
+- 评估里的 `limitations` 是模型写的说明文字，与 main 一样并入返回的 `limitations`。
 - 回答超过输出上限时保留已生成内容，标记 `partial` 和 `MODEL_STREAM_OUTPUT_TRUNCATED`。
 - 尚未在真实 Gateway / 真实 VM 上验收；镜像未在 Docker 中实际构建。
 - 监控和告警：各组件已在本机用相同配置验证（告警规则另有单元测试），尚未在服务器的 Docker 里实际运行。

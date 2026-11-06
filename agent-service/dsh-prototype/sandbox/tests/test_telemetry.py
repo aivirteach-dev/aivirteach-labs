@@ -17,6 +17,7 @@ from opentelemetry.trace import StatusCode
 
 from dsh_tutor import platform_models
 from dsh_tutor.platform_app import Diagnoser, create_app
+from dsh_tutor.platform_assessment import is_answer_stage
 from dsh_tutor.platform_runtime import ModelCall, RunOutcome
 from dsh_tutor.telemetry import RequestTrace, Telemetry, provider_name, tracing_requested
 from test_platform_api import EmptyCourses, body, headers, settings
@@ -32,17 +33,24 @@ def memory_telemetry(capture_content=False):
                      capture_content=capture_content), exporter
 
 
+ASSESSMENT = ('{"diagnosis": {"summary": "VM ok", "probable_causes": [], "confidence": "low"}, '
+              '"course_alignment": {"expected": [], "observed": []}, "evidence_ids": [], '
+              '"suggested_actions": [], "limitations": []}')
+
+
 def tool_run(prompt, dsh, on_event, cancel, tools):
-    """模拟一次“调工具 → 回答”的运行，带事件文件里的毫秒时间戳。"""
+    """模拟“评估阶段调一次工具 → 回答阶段输出文字”，带事件文件里的毫秒时间戳。"""
     now = int(time.time() * 1000)
-    on_event("delta", {"call": 2, "text": "好"})
-    return RunOutcome(
-        "好", "completed", [USAGE, USAGE], None,
-        calls=[ModelCall(1, now, None, now + 300, "toolUse", None, USAGE),
-               ModelCall(2, now + 420, now + 500, now + 900, "stop", None, USAGE)],
-        tool_events=[{"name": "tool_started", "t": now + 310, "data": {"tool": "get_vm_status"}},
-                     {"name": "tool_finished", "t": now + 410, "data": {"tool": "get_vm_status", "status": "ok",
-                                                                       "duration_ms": 100, "observation_id": "obs-001"}}])
+    if not is_answer_stage(dsh.system_prompt):
+        return RunOutcome(ASSESSMENT, "completed", [USAGE], None,
+                          calls=[ModelCall(1, now, None, now + 300, "toolUse", None, USAGE)],
+                          tool_events=[{"name": "tool_started", "t": now + 310, "data": {"tool": "get_vm_status"}},
+                                       {"name": "tool_finished", "t": now + 410, "data": {
+                                           "tool": "get_vm_status", "status": "ok", "duration_ms": 100,
+                                           "observation_id": "obs-001"}}])
+    on_event("delta", {"call": 1, "text": "好"})
+    return RunOutcome("好", "completed", [USAGE], None,
+                      calls=[ModelCall(1, now + 120, now + 200, now + 600, "stop", None, USAGE)])
 
 
 def spans_by_kind(exporter):
@@ -69,7 +77,7 @@ class SpanTests(unittest.TestCase):
         self.assertEqual(root.attributes["aivirteach.status"], "completed")
         self.assertEqual((root.attributes["aivirteach.model_calls"], root.attributes["aivirteach.tool_calls"]), (2, 1))
         self.assertIn("aivirteach.queue_wait_ms", root.attributes)
-        self.assertGreaterEqual(root.attributes["aivirteach.time_to_first_token_ms"], 500)  # 第二次调用的首字
+        self.assertGreaterEqual(root.attributes["aivirteach.time_to_first_token_ms"], 200)  # 回答阶段的首字
         self.assertEqual(root.status.status_code, StatusCode.UNSET)
         self.assertEqual(tool.name, "execute_tool get_vm_status")
         self.assertEqual(tool.attributes["aivirteach.observation_id"], "obs-001")
@@ -88,6 +96,9 @@ class SpanTests(unittest.TestCase):
         self.assertEqual((a["gen_ai.provider.name"], a["llm.provider"], a["llm.model_name"]),
                          ("deepseek", "deepseek", "deepseek-v4-flash"))
         self.assertEqual(tuple(a["gen_ai.response.finish_reasons"]), ("stop",))
+        self.assertEqual([s.attributes["aivirteach.phase"] for s in sorted(spans_by_kind(exporter)["LLM"],
+                                                                      key=lambda s: s.start_time)],
+                         ["assessment", "answer"])
         self.assertEqual(a["aivirteach.time_to_first_token_ms"], 80)
         self.assertEqual((second.end_time - second.start_time) // 1_000_000, 480)
 

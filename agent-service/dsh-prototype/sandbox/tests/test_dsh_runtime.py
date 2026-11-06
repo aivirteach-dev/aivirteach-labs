@@ -115,7 +115,7 @@ class DshRuntimeTests(unittest.TestCase):
         with fake_model.serve(fake_gateway.app) as gateway:
             outcome, _, requests = self.run_script([{"tool": "get_vm_status"}, {"text": ["不会到这里"]}],
                                                    tools=lambda _: self.tools(gateway), max_model_calls=1)
-        self.assertEqual(outcome.error, "MODEL_BUDGET_EXHAUSTED")
+        self.assertEqual((outcome.error, outcome.budget_stop), ("MODEL_BUDGET_EXHAUSTED", "model_calls"))
         self.assertEqual(len(requests), 1)
 
     def test_length_finish_is_reported_as_truncated(self):

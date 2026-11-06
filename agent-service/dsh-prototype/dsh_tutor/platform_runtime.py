@@ -43,7 +43,7 @@ class DshSettings:
     total_timeout_seconds: int
     state_dir: Path
     reasoning_off: bool = True
-    max_model_calls: int = 5  # main：最多 4 轮推理 + 1 次收尾
+    max_model_calls: int = 4  # 本次 DSH 会话最多调用模型几次
     # 助教规则，作为模型看到的系统消息（经 DSH 的 DSH_SYSTEM_PROMPT）；为空时是 DSH 默认的“软件工程师助手”。
     system_prompt: str = ""
 
@@ -64,6 +64,7 @@ class ModelCall:
     finish: Optional[str] = None
     error: Optional[str] = None
     usage: Optional[dict] = None
+    phase: str = ""  # assessment / finalization / answer，由 Diagnoser 填写
 
 
 @dataclass
@@ -78,6 +79,7 @@ class RunOutcome:
     partial: bool = False
     calls: list = field(default_factory=list)  # ModelCall；没有 end_ms 的调用即“未正常结束”
     tool_events: list = field(default_factory=list)  # {name, t, data}：tool_started / tool_finished
+    budget_stop: Optional[str] = None  # 预算插件的停止原因，如 model_calls（检查次数用完）
 
 
 class _StreamTail(threading.Thread):
@@ -219,9 +221,10 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
             tail.stop()
         calls = [tail.calls[k] for k in sorted(tail.calls)]
         finishes = [c.finish for c in calls if c.finish]
+        budget_stop = read_budget_stop(run_dir)
         if cancel_path.exists():
             error = "CANCELLED"
-        elif read_budget_stop(run_dir):
+        elif budget_stop:
             error = "MODEL_BUDGET_EXHAUSTED"
         elif failure is not None:
             raise failure
@@ -230,6 +233,7 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
         else:
             error = None
         return RunOutcome(answer, finish_reason, [c.usage for c in calls if c.usage], error,
-                          tail.evidence, tail.traces, tail.limitations, tail.partial, calls, tail.tool_events)
+                          tail.evidence, tail.traces, tail.limitations, tail.partial, calls, tail.tool_events,
+                          budget_stop)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)

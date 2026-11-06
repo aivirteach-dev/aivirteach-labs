@@ -24,7 +24,8 @@ PROJECT_NAME = "aivirteach-agent"  # Phoenix 里的项目名，可用 OTEL_RESOU
 AGENT_NAME = "aivirteach-tutor"
 # 返回里出现这些限制码说明本次请求没有正常完成，span 标为 ERROR。
 FAILURE_CODES = ("AGENT_BUSY", "AGENT_TOTAL_TIMEOUT", "MODEL_PROVIDER_ERROR", "MODEL_BUDGET_EXHAUSTED", "CANCELLED",
-                 "MODEL_STREAM_INCOMPLETE", "MODEL_STREAM_OUTPUT_TRUNCATED")
+                 "MODEL_STREAM_INCOMPLETE", "MODEL_STREAM_OUTPUT_TRUNCATED", "MODEL_STREAM_EMPTY",
+                 "MODEL_STREAM_ERROR", "MODEL_OUTPUT_UNSTRUCTURED", "MODEL_REFERENCED_UNKNOWN_EVIDENCE")
 # 模型调用以这些结束原因收尾时视为失败（例如连不上模型服务时 DSH 给出 error）。
 ERROR_FINISHES = ("error", "aborted")
 
@@ -141,7 +142,7 @@ class Telemetry:
         failure = next((code for code in limitations if code in FAILURE_CODES), None)
         if response is None:
             failure = "CLIENT_DISCONNECTED"
-        # 学生看到的回答来自最后一次模型调用；之前调用里调工具前的开场白不显示，不算首字。
+        # 学生看到的回答来自最后一次模型调用（回答阶段）；评估阶段的文字不显示，不算首字。
         first_delta = calls[-1].first_delta_ms if calls else None
         ends = [response_ns] + [_ns(c.end_ms) for c in calls if c.end_ms] + [_ns(e.get("t")) for e in tools if e.get("t")]
 
@@ -190,6 +191,7 @@ class Telemetry:
                                               "llm.provider": self.provider_name,
                                               "llm.model_name": self.model,
                                               "aivirteach.call": call.call,
+                                              "aivirteach.phase": getattr(call, "phase", "") or "unknown",
                                               **_usage_attributes(call.usage)})
             if call.first_delta_ms is not None:
                 span.set_attribute("aivirteach.time_to_first_token_ms", call.first_delta_ms - call.start_ms)
