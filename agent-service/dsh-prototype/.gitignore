@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .env
 .env.*
+.alertmanager.yml
 !.env.example
 *.log
 *.jsonl

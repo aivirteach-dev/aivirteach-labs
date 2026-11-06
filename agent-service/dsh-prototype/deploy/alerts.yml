@@ -1,0 +1,112 @@
+# 告警规则（Prometheus）。指标来自 OpenTelemetry Collector（deploy/otel-collector.yaml）：
+#   traces_span_metrics_*        每类 span 的次数和耗时，按 status_code、error_type、gen_ai_operation_name 细分
+#   aivirteach_llm_*_tokens_total 模型 token 累计
+#   httpcheck_status             Agent / Phoenix 健康接口探测
+#   otelcol_exporter_*           Collector 发往 Phoenix 的结果
+# 规则的单元测试在 deploy/alerts.test.yml（promtool test rules）。阈值按实际流量调整后重新跑测试。
+groups:
+  - name: aivirteach-agent
+    rules:
+      - alert: AgentDown
+        expr: max by (http_url) (httpcheck_status{http_url=~".*/health", http_status_class="2xx"}) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: DSH Agent 健康检查失败
+          description: "{{ $labels.http_url }} 连续 2 分钟没有返回 2xx，学生提问会失败。"
+
+      - alert: AgentErrorRateHigh
+        expr: |
+          (
+            sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", status_code="STATUS_CODE_ERROR"}[10m]))
+            / sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent"}[10m]))
+          ) > 0.2
+          and sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent"}[10m])) >= 5
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: Agent 请求失败率超过 20%
+          description: "最近 10 分钟失败率 {{ $value | humanizePercentage }}。在 Phoenix 里按 status=ERROR 过滤，看 error.type。"
+
+      - alert: AgentTimeouts
+        expr: sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", error_type="AGENT_TOTAL_TIMEOUT"}[15m])) >= 3
+        labels: {severity: warning}
+        annotations:
+          summary: Agent 总超时频繁
+          description: "最近 15 分钟有 {{ $value | humanize }} 个请求超过总时限，学生拿到的是兜底回答。"
+
+      - alert: AgentBusy
+        expr: sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", error_type="AGENT_BUSY"}[10m])) >= 1
+        labels: {severity: warning}
+        annotations:
+          summary: Agent 并发名额用满
+          description: "最近 10 分钟有请求排队到超时（AGENT_BUSY），考虑调高 AIVIRTEACH_MAX_CONCURRENT_REQUESTS 或扩容。"
+
+      - alert: AgentSlow
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(traces_span_metrics_duration_milliseconds_bucket{gen_ai_operation_name="invoke_agent"}[15m]))) > 30000
+          and sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent"}[15m])) >= 5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Agent 回答变慢
+          description: "最近 15 分钟 95% 的请求耗时在 {{ $value | humanize }} 毫秒以内，超过 30 秒。"
+
+      - alert: ModelCallErrorRateHigh
+        expr: |
+          (
+            sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="chat", status_code="STATUS_CODE_ERROR"}[10m]))
+            / sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="chat"}[10m]))
+          ) > 0.2
+          and sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="chat"}[10m])) >= 5
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: 模型调用失败率超过 20%
+          description: "最近 10 分钟模型调用失败率 {{ $value | humanizePercentage }}，检查模型服务和密钥。"
+
+      - alert: GatewayErrors
+        expr: |
+          sum(increase(traces_span_metrics_calls_total{gen_ai_operation_name="execute_tool",
+              error_type=~"GATEWAY_.*|VM_NOT_FOUND|GUEST_AGENT_UNAVAILABLE"}[15m])) >= 5
+        labels: {severity: warning}
+        annotations:
+          summary: 诊断工具调用 Gateway 频繁失败
+          description: "最近 15 分钟有 {{ $value | humanize }} 次工具调用因 Gateway 或虚拟机问题失败。"
+
+      - alert: TokenUsageHigh
+        expr: sum(increase(aivirteach_llm_input_tokens_total[1h])) + sum(increase(aivirteach_llm_output_tokens_total[1h])) > 2000000
+        labels: {severity: warning}
+        annotations:
+          summary: 模型 token 用量异常
+          description: "最近 1 小时用了 {{ $value | humanize }} 个 token（阈值 200 万），检查是否有异常流量。"
+
+  - name: aivirteach-monitoring
+    rules:
+      - alert: MonitoringPipelineDown
+        expr: up{job="otel-collector"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: 监控数据中转（Collector）不可用
+          description: Prometheus 抓不到 Collector 的指标，上面的 Agent 告警都会失效。
+
+      - alert: PhoenixDown
+        expr: max by (http_url) (httpcheck_status{http_url=~".*/healthz", http_status_class="2xx"}) == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Phoenix 健康检查失败
+          description: "{{ $labels.http_url }} 连续 5 分钟不可用，期间的 trace 会丢失（不影响学生）。"
+
+      - alert: PhoenixExportFailing
+        # Collector 自身的计数器没有创建时间：重启后第一次出现的失败 increase() 算不到，用第二个条件补上。
+        expr: |
+          sum(increase(otelcol_exporter_send_failed_spans{exporter="otlp_http/phoenix"}[10m])) > 0
+          or sum(otelcol_exporter_send_failed_spans{exporter="otlp_http/phoenix"}
+                 - (otelcol_exporter_send_failed_spans{exporter="otlp_http/phoenix"} offset 10m
+                    or otelcol_exporter_send_failed_spans{exporter="otlp_http/phoenix"} * 0)) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: 监控数据写不进 Phoenix
+          description: "最近 10 分钟有 {{ $value | humanize }} 个 span 发送失败，常见原因是 PHOENIX_API_KEY 错误或 Phoenix 磁盘到上限。"

@@ -1,0 +1,91 @@
+# OpenTelemetry Collector：接收 Agent 的 trace，原样转给 Phoenix，同时生成告警用的指标给 Prometheus。
+# 地址都可用环境变量改（本机测试用），容器里用默认值。
+extensions:
+  health_check:
+    endpoint: ${env:OTELCOL_BIND:-0.0.0.0}:13133
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: ${env:OTELCOL_BIND:-0.0.0.0}:4318
+  # 每 30 秒探测一次 Agent 和 Phoenix 的健康接口，挂了就告警。
+  http_check:
+    collection_interval: 30s
+    targets:
+      - endpoint: ${env:AGENT_HEALTH_URL:-http://dsh-agent:8770/health}
+        method: GET
+      - endpoint: ${env:PHOENIX_HEALTH_URL:-http://phoenix:6006/healthz}
+        method: GET
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch: {}
+  # 去掉 Agent 每次启动随机生成的 service.instance.id：Agent 重启后指标仍是同一条序列，告警不会漏掉重启后的第一次失败。
+  transform/drop_instance_id:
+    trace_statements:
+      - delete_key(resource.attributes, "service.instance.id")
+
+connectors:
+  # 每类 span 的次数、失败次数和耗时分布；按 error.type 和操作类型（invoke_agent / chat / execute_tool）细分。
+  span_metrics:
+    histogram:
+      explicit:
+        buckets: [250ms, 500ms, 1s, 2s, 5s, 10s, 20s, 30s, 40s, 60s, 120s]
+    dimensions:
+      - name: gen_ai.operation.name
+      - name: error.type
+    metrics_flush_interval: 15s
+  # 每次模型调用的 token 累加（输入含缓存命中），用于用量异常告警。
+  sum:
+    spans:
+      aivirteach.llm.input_tokens:
+        description: Input tokens per model call, cache reads included.
+        source_attribute: gen_ai.usage.input_tokens
+        attributes:
+          - key: gen_ai.request.model
+      aivirteach.llm.output_tokens:
+        description: Output tokens per model call.
+        source_attribute: gen_ai.usage.output_tokens
+        attributes:
+          - key: gen_ai.request.model
+
+exporters:
+  otlp_http/phoenix:
+    endpoint: ${env:PHOENIX_ENDPOINT:-http://phoenix:6006}
+    headers:
+      authorization: "Bearer ${env:PHOENIX_API_KEY}"
+  prometheus:
+    endpoint: ${env:OTELCOL_BIND:-0.0.0.0}:8889
+  # 健康探测单独导出，45 秒没有更新的序列就丢掉：否则探测失败后，上一次成功（200）的序列还会留 5 分钟，AgentDown 报不出来。
+  prometheus/health:
+    endpoint: ${env:OTELCOL_BIND:-0.0.0.0}:8890
+    metric_expiration: 45s
+
+service:
+  extensions: [health_check]
+  telemetry:
+    # Collector 自己的指标（含发往 Phoenix 失败的 span 数），给 Prometheus 抓取。
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: ${env:OTELCOL_BIND:-0.0.0.0}
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/drop_instance_id, batch]
+      exporters: [otlp_http/phoenix, span_metrics, sum]
+    metrics:
+      receivers: [span_metrics, sum]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    metrics/health:
+      receivers: [http_check]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus/health]

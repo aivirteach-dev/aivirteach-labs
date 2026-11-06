@@ -1,0 +1,38 @@
+# 带通知渠道的 Alertmanager 配置示例。用法：
+#   cp deploy/alertmanager.example.yml .alertmanager.yml       # 已被 .gitignore 忽略
+#   填好下面的地址和密钥，只保留要用的渠道
+#   chgrp 65534 .alertmanager.yml && chmod 640 .alertmanager.yml   # 容器内的 nobody 用户要能读，其他用户不能读
+#   在 .env.monitoring 里加 ALERTMANAGER_CONFIG=./.alertmanager.yml，然后重启 alertmanager
+#   检查格式：docker run --rm -v "$PWD/.alertmanager.yml:/c.yml:ro" --entrypoint amtool prom/alertmanager:v0.34.1 check-config /c.yml
+# 钉钉、飞书没有内置支持，需要另加一个 webhook 转换服务，暂不提供。
+global:
+  # 邮件（SMTP）
+  smtp_smarthost: "smtp.example.com:465"
+  smtp_from: "alerts@example.com"
+  smtp_auth_username: "alerts@example.com"
+  smtp_auth_password: "填 SMTP 授权码"
+  smtp_require_tls: true
+
+route:
+  receiver: ops
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: ops
+    email_configs:
+      - to: "you@example.com"
+        send_resolved: true
+    # 企业微信（应用消息）：在企业微信管理后台创建应用，拿到企业 ID、应用 Secret 和 AgentId。
+    wechat_configs:
+      - corp_id: "填企业 ID"
+        api_secret: "填应用 Secret"
+        agent_id: "填 AgentId"
+        to_user: "@all"
+        send_resolved: true
+
+inhibit_rules:
+  - source_matchers: [alertname="AgentDown"]
+    target_matchers: [alertname=~"AgentErrorRateHigh|AgentTimeouts|AgentSlow|ModelCallErrorRateHigh"]

@@ -25,6 +25,8 @@ AGENT_NAME = "aivirteach-tutor"
 # 返回里出现这些限制码说明本次请求没有正常完成，span 标为 ERROR。
 FAILURE_CODES = ("AGENT_BUSY", "AGENT_TOTAL_TIMEOUT", "MODEL_PROVIDER_ERROR", "MODEL_BUDGET_EXHAUSTED", "CANCELLED",
                  "MODEL_STREAM_INCOMPLETE", "MODEL_STREAM_OUTPUT_TRUNCATED")
+# 模型调用以这些结束原因收尾时视为失败（例如连不上模型服务时 DSH 给出 error）。
+ERROR_FINISHES = ("error", "aborted")
 
 
 def provider_name(model_provider: str, base_url: str) -> str:
@@ -193,8 +195,8 @@ class Telemetry:
                 span.set_attribute("aivirteach.time_to_first_token_ms", call.first_delta_ms - call.start_ms)
             if call.finish:
                 span.set_attribute("gen_ai.response.finish_reasons", [call.finish])
-            if call.error or call.end_ms is None:
-                code = call.error or "not_finished"
+            if call.error or call.end_ms is None or call.finish in ERROR_FINISHES:
+                code = call.error or (call.finish if call.finish in ERROR_FINISHES else "not_finished")
                 span.set_attribute("error.type", code)
                 span.set_status(Status(StatusCode.ERROR, code))
             span.end(end_time=_ns(call.end_ms) or max(ends))

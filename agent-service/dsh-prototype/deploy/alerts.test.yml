@@ -1,0 +1,176 @@
+# 告警规则单元测试：promtool test rules deploy/alerts.test.yml
+rule_files:
+  - alerts.yml
+evaluation_interval: 1m
+
+tests:
+  # Agent 健康检查连续失败 → AgentDown；Phoenix 正常 → 不报 PhoenixDown
+  - interval: 1m
+    input_series:
+      - series: 'httpcheck_status{http_url="http://dsh-agent:8770/health", http_status_class="2xx"}'
+        values: '1 1 0 0 0 0 0'
+      - series: 'httpcheck_status{http_url="http://phoenix:6006/healthz", http_status_class="2xx"}'
+        values: '1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AgentDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: AgentDown
+        exp_alerts:
+          - exp_labels: {severity: critical, http_url: "http://dsh-agent:8770/health"}
+            exp_annotations:
+              summary: DSH Agent 健康检查失败
+              description: "http://dsh-agent:8770/health 连续 2 分钟没有返回 2xx，学生提问会失败。"
+      - eval_time: 6m
+        alertname: PhoenixDown
+        exp_alerts: []
+
+  # 一半请求失败、流量足够 → AgentErrorRateHigh；模型调用一半失败 → ModelCallErrorRateHigh
+  - interval: 1m
+    input_series:
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", status_code="STATUS_CODE_ERROR", error_type="MODEL_STREAM_INCOMPLETE"}'
+        values: '0+1x20'
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", status_code="STATUS_CODE_UNSET"}'
+        values: '0+1x20'
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="chat", status_code="STATUS_CODE_ERROR"}'
+        values: '0+1x20'
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="chat", status_code="STATUS_CODE_UNSET"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: AgentErrorRateHigh
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: Agent 请求失败率超过 20%
+              description: "最近 10 分钟失败率 50%。在 Phoenix 里按 status=ERROR 过滤，看 error.type。"
+      - eval_time: 15m
+        alertname: ModelCallErrorRateHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: 模型调用失败率超过 20%
+              description: "最近 10 分钟模型调用失败率 50%，检查模型服务和密钥。"
+
+  # 流量太少（10 分钟内只有 2 个请求）时，即使全部失败也不报失败率
+  - interval: 1m
+    input_series:
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", status_code="STATUS_CODE_ERROR"}'
+        values: '0 0 0 1 1 1 2 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: AgentErrorRateHigh
+        exp_alerts: []
+
+  # 15 分钟内 3 次总超时 → AgentTimeouts；1 次排队超时 → AgentBusy；Gateway 频繁失败 → GatewayErrors
+  - interval: 1m
+    input_series:
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", status_code="STATUS_CODE_ERROR", error_type="AGENT_TOTAL_TIMEOUT"}'
+        values: '0 0 1 2 3 3 3 3 3 3 3'
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", status_code="STATUS_CODE_ERROR", error_type="AGENT_BUSY"}'
+        values: '0 0 0 0 0 1 1 1 1 1 1'
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="execute_tool", status_code="STATUS_CODE_ERROR", error_type="GATEWAY_TIMEOUT"}'
+        values: '0+1x10'
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="execute_tool", status_code="STATUS_CODE_ERROR", error_type="TOOL_NOT_ALLOWED"}'
+        values: '0+5x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AgentTimeouts
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Agent 总超时频繁
+              description: "最近 15 分钟有 3 个请求超过总时限，学生拿到的是兜底回答。"
+      - eval_time: 10m
+        alertname: AgentBusy
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Agent 并发名额用满
+              description: "最近 10 分钟有请求排队到超时（AGENT_BUSY），考虑调高 AIVIRTEACH_MAX_CONCURRENT_REQUESTS 或扩容。"
+      - eval_time: 10m
+        alertname: GatewayErrors
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: 诊断工具调用 Gateway 频繁失败
+              description: "最近 15 分钟有 10 次工具调用因 Gateway 或虚拟机问题失败。"
+
+  # 95% 的请求在 30～40 秒之间 → AgentSlow
+  - interval: 1m
+    input_series:
+      - series: 'traces_span_metrics_duration_milliseconds_bucket{gen_ai_operation_name="invoke_agent", le="30000"}'
+        values: '0x30'
+      - series: 'traces_span_metrics_duration_milliseconds_bucket{gen_ai_operation_name="invoke_agent", le="40000"}'
+        values: '0+1x30'
+      - series: 'traces_span_metrics_duration_milliseconds_bucket{gen_ai_operation_name="invoke_agent", le="+Inf"}'
+        values: '0+1x30'
+      - series: 'traces_span_metrics_calls_total{gen_ai_operation_name="invoke_agent", status_code="STATUS_CODE_UNSET"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: AgentSlow
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Agent 回答变慢
+              description: "最近 15 分钟 95% 的请求耗时在 39.5k 毫秒以内，超过 30 秒。"
+
+  # 每分钟 10 万 token → 1 小时 600 万，超过 200 万 → TokenUsageHigh
+  - interval: 1m
+    input_series:
+      - series: 'aivirteach_llm_input_tokens_total{gen_ai_request_model="deepseek-v4-flash"}'
+        values: '0+100000x70'
+      - series: 'aivirteach_llm_output_tokens_total{gen_ai_request_model="deepseek-v4-flash"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: TokenUsageHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: 模型 token 用量异常
+              description: "最近 1 小时用了 6M 个 token（阈值 200 万），检查是否有异常流量。"
+
+  # Collector 抓不到 → MonitoringPipelineDown；发往 Phoenix 失败 → PhoenixExportFailing
+  - interval: 1m
+    input_series:
+      - series: 'up{job="otel-collector"}'
+        values: '1 1 0 0 0 0'
+      - series: 'otelcol_exporter_send_failed_spans{exporter="otlp_http/phoenix"}'
+        values: '0 0 5 5 5 5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MonitoringPipelineDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: otel-collector}
+            exp_annotations:
+              summary: 监控数据中转（Collector）不可用
+              description: Prometheus 抓不到 Collector 的指标，上面的 Agent 告警都会失效。
+      - eval_time: 5m
+        alertname: PhoenixExportFailing
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: 监控数据写不进 Phoenix
+              description: "最近 10 分钟有 5 个 span 发送失败，常见原因是 PHOENIX_API_KEY 错误或 Phoenix 磁盘到上限。"
+
+  # Collector 刚启动就发送失败（失败计数第一次出现，之前没有这条序列）也要报
+  - interval: 1m
+    input_series:
+      - series: 'up{job="otel-collector"}'
+        values: '1 1 1 1 1 1'
+      - series: 'otelcol_exporter_send_failed_spans{exporter="otlp_http/phoenix"}'
+        values: '_ _ 5 5 5 5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PhoenixExportFailing
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: 监控数据写不进 Phoenix
+              description: "最近 10 分钟有 5 个 span 发送失败，常见原因是 PHOENIX_API_KEY 错误或 Phoenix 磁盘到上限。"
+      - eval_time: 5m
+        alertname: MonitoringPipelineDown
+        exp_alerts: []

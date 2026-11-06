@@ -1,0 +1,25 @@
+# Prometheus：抓取 Collector 生成的指标，按 deploy/alerts.yml 判断告警，交给 Alertmanager 通知。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # 用 Prometheus protobuf 格式抓取，才能拿到计数器的创建时间（配合 --enable-feature=created-timestamp-zero-ingestion）：
+  # 新出现的错误类型、Collector 重启后的第一次失败，也能算进 increase()。
+  scrape_protocols: [PrometheusProto, OpenMetricsText1.0.0, PrometheusText0.0.4]
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # span 指标和 token 累计（8889）、健康探测（8890）
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889", "otel-collector:8890"]
+  # Collector 自身（发往 Phoenix 成功/失败的数量）
+  - job_name: otel-collector-self
+    static_configs:
+      - targets: ["otel-collector:8888"]

@@ -9,7 +9,7 @@ Agent 按 OpenTelemetry 标准发送监控数据（`dsh_tutor/telemetry.py`）�
 | span | 类型 | 内容 |
 |---|---|---|
 | `invoke_agent aivirteach-tutor` | AGENT | 整个请求：request_id、lab_id、课程和课时、是否流式、返回状态、限制码、模型调用次数、工具调用次数、排队时间、首字延迟、总耗时 |
-| `chat <模型>` | LLM | 每次模型调用：耗时、首字延迟、输入/输出/缓存命中 token、结束原因、失败原因 |
+| `chat <模型>` | LLM | 每次模型调用：耗时、首字延迟、输入/输出/缓存命中 token、结束原因、失败原因（含提供方返回的 error / aborted） |
 | `execute_tool <工具>` | TOOL | 每次工具调用：耗时、结果状态（ok/cached/denied/error）、错误码、证据编号 |
 
 - 时间来自事件文件里的毫秒时间戳，请求结束后一次性补记，不拖慢回答。超时或调用方断开时，等 DSH 真正停下再记，所以这些情况也能看到每次调用的情况。
@@ -46,21 +46,32 @@ Phoenix 不内置 DeepSeek 的价格：要看费用，在 Settings → Models �
 
 ## 服务器部署
 
-`compose.monitoring.yaml` 叠加在 `compose.platform.yaml` 上，Phoenix 和 DSH Agent 在同一个 compose 项目里，Agent 经容器网络把数据发给 `http://phoenix:6006`。
+`compose.monitoring.yaml` 叠加在 `compose.platform.yaml` 上，和 DSH Agent 在同一个 compose 项目里运行：
 
-### Phoenix 的安全设置
+```
+Agent ──trace──> otel-collector ──trace──> phoenix       查看每次请求（6006）
+                       └──指标──> prometheus ──> alertmanager   告警规则（9090）→ 通知（9093）
+```
+
+- **Agent** 只把数据发给 Collector（容器网络内，不需要密钥）。
+- **Collector**（OpenTelemetry Collector）把 trace 原样转给 Phoenix（带 Phoenix API key），同时从 trace 生成告警用的指标：每类请求、模型调用、工具调用的次数、失败数和耗时（按 `error.type` 细分），以及 token 累计；每 30 秒探测 Agent 和 Phoenix 的健康接口。它不发布任何端口。
+- **Prometheus** 抓取这些指标，按 `deploy/alerts.yml` 判断告警。
+- **Alertmanager** 负责通知、合并重复告警。默认不发通知（告警只显示在它的界面里），配置方法见下面的“告警通知”。
+
+全部是开源组件，镜像都固定了版本和 digest。
+
+### 安全设置
 
 | 设置 | 作用 |
 |---|---|
-| 端口只发布在 `127.0.0.1:6006` | 公网和内网都访问不到，只能从服务器本机或 SSH 隧道访问；gRPC 4317 不发布 |
-| `PHOENIX_ENABLE_AUTH=true` | 界面要登录；REST 读取和 OTLP 写入都要 API key，否则返回 401 |
-| 强密码策略 | 至少 12 位，含大小写、数字和特殊字符 |
-| 保留 30 天 | 超过 30 天的 trace 每周日 0 点清理，所以最长约保留 37 天 |
-| 磁盘上限 10 GiB，用到 90% 停止写入 | 防止监控数据写满磁盘；删除不受影响 |
-| 关闭统计像素、外部字体 | Phoenix 不向外部发送任何东西 |
-| 关闭 AI 助手（含服务器端 Shell、联网、GitHub）、MCP 接口、代码沙箱 | 这些功能用不到，关掉减少攻击面 |
-| 非 root（uid 65532）、只读根文件系统、去掉全部 capabilities、`no-new-privileges`、内存 1 GiB、进程数 256 | 容器加固，与 Agent 容器同样的做法 |
-| 镜像固定版本和 digest | `version-20.16.0-nonroot`，与本地验证的版本相同 |
+| 界面只发布在 `127.0.0.1`（Phoenix 6006、Prometheus 9090、Alertmanager 9093） | 公网和内网都访问不到，只能从服务器本机或 SSH 隧道访问；Collector、Phoenix gRPC 4317、Alertmanager 集群端口 9094 都不开放 |
+| Phoenix 开启登录 | 界面要登录；REST 读取和 OTLP 写入都要 API key，否则返回 401 |
+| Phoenix 强密码策略 | 至少 12 位，含大小写、数字和特殊字符 |
+| Phoenix 保留 30 天 | 超过 30 天的 trace 每周日 0 点清理，所以最长约保留 37 天 |
+| Phoenix 磁盘上限 10 GiB，用到 90% 停止写入 | 防止监控数据写满磁盘；删除不受影响 |
+| Prometheus 保留 15 天、最多 2 GB | 告警只需要近期数据 |
+| Phoenix 关闭统计像素、外部字体、AI 助手（含服务器端 Shell、联网、GitHub）、MCP 接口、代码沙箱 | 不向外部发送任何东西，减少攻击面 |
+| 所有容器非 root、只读根文件系统、去掉全部 capabilities、`no-new-privileges`、限内存和进程数 | 与 Agent 容器同样的加固 |
 
 ### 第一次部署
 
@@ -71,30 +82,67 @@ Phoenix 不内置 DeepSeek 的价格：要看费用，在 Settings → Models �
 cp deploy/monitoring.env.example .env.monitoring && chmod 600 .env.monitoring
 #    填 PHOENIX_SECRET（openssl rand -hex 32）和 PHOENIX_ADMIN_INITIAL_PASSWORD；PHOENIX_API_KEY 先留空
 
-# 2. 启动 Agent 和 Phoenix
+# 2. 启动
 docker compose -f compose.platform.yaml -f compose.monitoring.yaml \
   --env-file ../../config.env --env-file .env.monitoring up -d --build
 
-# 3. 在自己的电脑上开 SSH 隧道（只转发到服务器本机地址），浏览器打开 http://localhost:6006
-ssh -N -L 127.0.0.1:6006:127.0.0.1:6006 用户@服务器
+# 3. 在自己的电脑上开 SSH 隧道（只转发到服务器本机地址）
+ssh -N -L 127.0.0.1:6006:127.0.0.1:6006 -L 127.0.0.1:9090:127.0.0.1:9090 -L 127.0.0.1:9093:127.0.0.1:9093 用户@服务器
+#    Phoenix http://localhost:6006   Prometheus http://localhost:9090   Alertmanager http://localhost:9093
 
-# 4. 用 admin@localhost 和初始密码登录 → Settings → API Keys → System Keys，新建 dsh-agent，
-#    把显示的 key 填进 .env.monitoring 的 PHOENIX_API_KEY，然后只重启 Agent：
+# 4. 用 admin@localhost 和初始密码登录 Phoenix → Settings → API Keys → System Keys，新建 otel-collector，
+#    把显示的 key 填进 .env.monitoring 的 PHOENIX_API_KEY，然后只重启 Collector：
 docker compose -f compose.platform.yaml -f compose.monitoring.yaml \
-  --env-file ../../config.env --env-file .env.monitoring up -d dsh-agent
+  --env-file ../../config.env --env-file .env.monitoring up -d otel-collector
 
 # 5. 检查
 deploy/check_monitoring.sh
 ```
 
-第 4 步之前 Agent 的监控数据会被 Phoenix 拒收（日志里有 `Failed to export spans batch code: 401`），但回答学生不受影响。
+第 4 步之前 Phoenix 会拒收数据，`PhoenixExportFailing` 告警会触发；告警指标和学生的回答都不受影响。
 
-`check_monitoring.sh` 检查：容器健康、非 root、6006 只在 127.0.0.1、4317 没发布、不带 key 写入和读取都被拒绝、保留期已设置、Agent 能连到 Phoenix 且 key 有效、没有开启问答原文记录。只读，不打印密钥。
+`check_monitoring.sh` 检查 20 项：各容器在运行；Phoenix 健康、非 root、端口只在 127.0.0.1、4317 没开放、不带 key 读写都被拒绝、保留期已设置、`PHOENIX_API_KEY` 有效；Collector 没开放端口；Prometheus 和 Alertmanager 只在 127.0.0.1、集群端口已关闭；抓取目标都正常、11 条规则已加载、Prometheus 连上了 Alertmanager、Agent 健康探测正常、没有 `PhoenixExportFailing`；Agent 发往 Collector、没有开启问答原文记录。只读，不打印密钥。
+
+### 告警规则
+
+规则在 `deploy/alerts.yml`，单元测试在 `deploy/alerts.test.yml`（`promtool test rules deploy/alerts.test.yml`）。改阈值后要重新跑测试。
+
+| 告警 | 级别 | 条件 |
+|---|---|---|
+| `AgentDown` | critical | Agent `/health` 连续 2 分钟不是 2xx |
+| `AgentErrorRateHigh` | critical | 10 分钟内请求失败率超过 20%，且至少 5 个请求，持续 2 分钟 |
+| `AgentTimeouts` | warning | 15 分钟内至少 3 个请求总超时（`AGENT_TOTAL_TIMEOUT`） |
+| `AgentBusy` | warning | 10 分钟内出现排队超时（`AGENT_BUSY`），说明并发名额用满 |
+| `AgentSlow` | warning | 15 分钟内 95% 分位耗时超过 30 秒，且至少 5 个请求，持续 5 分钟 |
+| `ModelCallErrorRateHigh` | warning | 10 分钟内模型调用失败率超过 20%，且至少 5 次调用，持续 2 分钟 |
+| `GatewayErrors` | warning | 15 分钟内至少 5 次工具调用因 Gateway 或虚拟机问题失败 |
+| `TokenUsageHigh` | warning | 1 小时内 token（输入含缓存命中 + 输出）超过 200 万 |
+| `MonitoringPipelineDown` | critical | Prometheus 连续 2 分钟抓不到 Collector（此时其他 Agent 告警都会失效） |
+| `PhoenixDown` | warning | Phoenix `/healthz` 连续 5 分钟不可用 |
+| `PhoenixExportFailing` | warning | 10 分钟内有 span 写不进 Phoenix（常见是 API key 错误或磁盘到上限） |
+
+`AgentDown` 触发时，失败率、超时、变慢、模型失败这几条告警不再重复通知。
+
+一个细节：计数器刚出现时（例如某种错误第一次发生），Prometheus 默认算不到这第一次。这里用 protobuf 格式抓取并开启 `created-timestamp-zero-ingestion`，让新计数器从 0 开始算；Collector 自身的计数器不带创建时间，`PhoenixExportFailing` 另加了一个条件补上。
+
+### 告警通知
+
+默认的 `deploy/alertmanager.yml` 不发通知。要发邮件或企业微信：
+
+```bash
+cp deploy/alertmanager.example.yml .alertmanager.yml       # 已被 .gitignore 忽略
+#   填好收件人、SMTP 或企业微信应用的信息，只保留要用的渠道
+chgrp 65534 .alertmanager.yml && chmod 640 .alertmanager.yml   # 容器里的 nobody 用户要能读，其他用户不能读
+echo "ALERTMANAGER_CONFIG=./.alertmanager.yml" >> .env.monitoring
+docker compose -f compose.platform.yaml -f compose.monitoring.yaml \
+  --env-file ../../config.env --env-file .env.monitoring up -d alertmanager
+```
+
+钉钉、飞书没有内置支持，需要另加一个 webhook 转换服务，暂不提供。
 
 ### 部署后
 
-- 首次登录后在 Settings → Models 添加 DeepSeek 的价格，才能看到费用。
+- 首次登录 Phoenix 后在 Settings → Models 添加 DeepSeek 的价格，才能看到费用。
 - 改了 `PHOENIX_ADMIN_INITIAL_PASSWORD` 不会影响已有的管理员；改密码在界面里做。
-- 数据在命名卷 `dsh-platform_phoenix-data` 里。删除它会清空所有监控数据。
-- 升级 Phoenix：先在测试环境验证新版本，再改 `compose.monitoring.yaml` 里的版本和 digest。
-- 告警（超时率、失败率、延迟）在监控阶段 4 接入。
+- 数据在命名卷 `dsh-platform_phoenix-data`、`dsh-platform_prometheus-data`、`dsh-platform_alertmanager-data` 里，删除会清空对应数据。
+- 升级任一组件：先在测试环境验证新版本（告警规则跑一遍 `promtool test rules`），再改 `compose.monitoring.yaml` 里的版本和 digest。

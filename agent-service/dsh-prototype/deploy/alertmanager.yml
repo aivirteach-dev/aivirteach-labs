@@ -1,0 +1,17 @@
+# Alertmanager 默认配置：还没有配置通知渠道，告警只显示在 Alertmanager 界面（服务器本机 127.0.0.1:9093）。
+# 要发邮件或企业微信，复制 deploy/alertmanager.example.yml 为 .alertmanager.yml，填好后在 .env.monitoring 里设
+# ALERTMANAGER_CONFIG=./.alertmanager.yml，见 docs/monitoring.md。
+route:
+  receiver: default
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: default
+
+inhibit_rules:
+  # Agent 整个挂了时，不再重复发失败率、超时等告警。
+  - source_matchers: [alertname="AgentDown"]
+    target_matchers: [alertname=~"AgentErrorRateHigh|AgentTimeouts|AgentSlow|ModelCallErrorRateHigh"]

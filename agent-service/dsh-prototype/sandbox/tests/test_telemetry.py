@@ -120,6 +120,16 @@ class SpanTests(unittest.TestCase):
         self.assertEqual((llm.status.status_code, llm.attributes["error.type"]), (StatusCode.ERROR, "budget"))
         self.assertEqual((tool.status.status_code, tool.attributes["error.type"]), (StatusCode.ERROR, "TOOL_NOT_ALLOWED"))
 
+    def test_model_call_that_finishes_with_error_is_marked_as_failed(self):
+        def unreachable(prompt, dsh, on_event, cancel, tools):
+            now = int(time.time() * 1000)
+            return RunOutcome("", "completed", [], None,
+                              calls=[ModelCall(1, now, None, now + 5, "error", None, None)])
+        telemetry, exporter = memory_telemetry()
+        self.run_app(unreachable, telemetry)
+        llm = spans_by_kind(exporter)["LLM"][0]
+        self.assertEqual((llm.status.status_code, llm.attributes["error.type"]), (StatusCode.ERROR, "error"))
+
     def test_timeout_waits_for_dsh_to_finish_before_recording(self):
         telemetry, exporter = memory_telemetry()
         finished = threading.Event()

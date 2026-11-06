@@ -24,7 +24,7 @@
 
 - 宿主机：`./start_platform.sh`，读取与 main 相同的 `agent-service/config/agent.env`（可用 `AIVIRTEACH_AGENT_ENV_FILE` 指定）。
 - 容器：`docker compose -f compose.platform.yaml --env-file ../../config.env up -d --build`。
-- 容器加监控（Phoenix）：再叠加 `-f compose.monitoring.yaml --env-file .env.monitoring`，步骤见 [docs/monitoring.md](docs/monitoring.md#服务器部署)。
+- 容器加监控和告警（Phoenix、OpenTelemetry Collector、Prometheus、Alertmanager）：再叠加 `-f compose.monitoring.yaml --env-file .env.monitoring`，步骤见 [docs/monitoring.md](docs/monitoring.md#服务器部署)。
 
 两种方式都占用 8770，与 main 的 agent-service 二选一。用真实 Gateway 验收见 [docs/platform-gateway-test.md](docs/platform-gateway-test.md)。
 
@@ -48,6 +48,7 @@ python3 -m venv .venv
 - `sandbox/tests/test_platform_api.py`：接口契约、鉴权、SSE、工具桥、用量、取消（不启动 DSH）。Python 3.11+ 且能导入 main 的 Agent 时，自动对比复制过来的模型、工具和脱敏代码。
 - `sandbox/tests/test_dsh_runtime.py`：真实 DSH + 假模型（`sandbox/fake_model.py`）+ 假 Gateway（`sandbox/fake_gateway.py`），检查文字片段、用量、工具调用、预算停止、截断、取消和时间戳。
 - `sandbox/tests/test_model_budget.mjs`：预算插件单元测试。
+- `sandbox/tests/test_deploy_config.py`：部署文件的安全设置；`promtool`、`amtool`、`otelcol-contrib` 在 PATH 时还检查告警规则（含 `deploy/alerts.test.yml`）和配置。
 - `sandbox/tests/test_telemetry.py`：监控 span 的结构、属性、token 换算、失败标记和隐私默认值（内存导出，不需要 Phoenix）。
 
 ## 实测（本地，假 Gateway）
@@ -61,4 +62,4 @@ python3 -m venv .venv
 - `diagnosis`、`course_alignment`、`suggested_actions` 留空：回答一次生成并逐段推送（main 先单独生成结构化 JSON）。Server 只要求这些字段存在，Client 只显示 `answer`。
 - 回答超过输出上限时保留已生成内容，标记 `partial` 和 `MODEL_STREAM_OUTPUT_TRUNCATED`。
 - 尚未在真实 Gateway / 真实 VM 上验收；镜像未在 Docker 中实际构建。
-- 监控：Phoenix 的部署文件已在本机用相同设置验证，尚未在服务器的 Docker 里实际运行；告警是后续阶段。
+- 监控和告警：各组件已在本机用相同配置验证（告警规则另有单元测试），尚未在服务器的 Docker 里实际运行。

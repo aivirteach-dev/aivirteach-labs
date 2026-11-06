@@ -1,18 +1,24 @@
-# 监控（Phoenix）。叠加在 compose.platform.yaml 上，与 DSH Agent 同一个 compose 项目运行：
+# 监控和告警。叠加在 compose.platform.yaml 上，与 DSH Agent 同一个 compose 项目运行：
 #   docker compose -f compose.platform.yaml -f compose.monitoring.yaml \
 #     --env-file ../../config.env --env-file .env.monitoring up -d --build
 # 变量见 deploy/monitoring.env.example，部署和检查步骤见 docs/monitoring.md。
-# Phoenix 的界面和接收地址只发布在服务器本机 127.0.0.1，从自己的电脑经 SSH 隧道访问。
+#   Agent ──trace──> otel-collector ──trace──> phoenix（查看每次请求）
+#                         └──指标──> prometheus（告警规则）──> alertmanager（通知）
+# 三个界面（Phoenix 6006、Prometheus 9090、Alertmanager 9093）只发布在服务器本机 127.0.0.1，经 SSH 隧道访问；
+# Collector 不发布任何端口。
+x-hardening: &hardening
+  restart: unless-stopped
+  init: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  read_only: true
+
 services:
   phoenix:
     # 20.16.0 已在本地验证；升级前先在测试环境重新验证。digest 是多架构索引（amd64、arm64）。
     image: arizephoenix/phoenix:version-20.16.0-nonroot@sha256:e4a41a209b07289581a5d48167a11051c12704ac48983056fe0989b6f13b467a
-    restart: unless-stopped
-    init: true
+    <<: *hardening
     user: "65532:65532"
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    read_only: true
     tmpfs:
       - "/tmp:size=64m,mode=1777,noexec,nosuid,nodev"
     pids_limit: 256
@@ -53,11 +59,79 @@ services:
       retries: 3
       start_period: 30s
 
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.163.2@sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849
+    <<: *hardening
+    user: "10001:10001"
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    pids_limit: 128
+    mem_limit: ${OTELCOL_MEM_LIMIT:-512m}
+    memswap_limit: ${OTELCOL_MEM_LIMIT:-512m}
+    environment:
+      # 首次部署时还没有 API key：先留空（Phoenix 拒收，PhoenixExportFailing 告警），在 Phoenix 里创建后填入再重启 Collector。
+      PHOENIX_API_KEY: "${PHOENIX_API_KEY:-}"
+    volumes:
+      - "./deploy/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro"
+
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    <<: *hardening
+    user: "65534:65534"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+      - "--storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-2GB}"
+      # 新出现的计数器从 0 开始算，第一次失败也能触发告警（配合 prometheus.yml 的 scrape_protocols）。
+      - "--enable-feature=created-timestamp-zero-ingestion"
+      - "--web.listen-address=:9090"
+    pids_limit: 128
+    mem_limit: ${PROMETHEUS_MEM_LIMIT:-512m}
+    memswap_limit: ${PROMETHEUS_MEM_LIMIT:-512m}
+    ports:
+      - "127.0.0.1:${PROMETHEUS_UI_PORT:-9090}:9090"
+    volumes:
+      - "./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro"
+      - "prometheus-data:/prometheus"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+    <<: *hardening
+    user: "65534:65534"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.listen-address=:9093"
+      # 单机运行：关闭集群端口 9094（默认会监听所有网卡）。
+      - "--cluster.listen-address="
+    pids_limit: 128
+    mem_limit: ${ALERTMANAGER_MEM_LIMIT:-256m}
+    memswap_limit: ${ALERTMANAGER_MEM_LIMIT:-256m}
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_UI_PORT:-9093}:9093"
+    volumes:
+      # 默认配置没有通知渠道；要发邮件或企业微信见 deploy/alertmanager.example.yml。
+      - "${ALERTMANAGER_CONFIG:-./deploy/alertmanager.yml}:/etc/alertmanager/alertmanager.yml:ro"
+      - "alertmanager-data:/alertmanager"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
   dsh-agent:
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://phoenix:6006"
-      # 首次部署时还没有 API key：先留空（监控数据被拒收，Agent 照常工作），在 Phoenix 里创建后填入再重启 Agent。
-      OTEL_EXPORTER_OTLP_HEADERS: "authorization=Bearer ${PHOENIX_API_KEY:-}"
+      # Agent 只发给 Collector（容器网络内，不需要密钥）；Phoenix 的 API key 只在 Collector 里。
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      OTEL_EXPORTER_OTLP_HEADERS: ""
 
 volumes:
   phoenix-data:
+  prometheus-data:
+  alertmanager-data:
