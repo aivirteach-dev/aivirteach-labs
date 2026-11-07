@@ -4,7 +4,7 @@
 
 - 只修改本模块；不改上级 `aivirteach_agent`、根 Compose、Server、Client 或 main，不 force-push，不自行部署。
 - 接口以 main 为准：`platform_models.py`、`platform_tools.py`、`platform_security.py`、`platform_course.py` 是 main 的副本，改动先改 main，再同步并保持对比测试通过。
-- `platform_screen.py`（虚拟机画面）是在 main 接口上的可选扩展：请求不带 `screen` 时，处理、返回和事件必须与 main 完全相同；截图只在内存里处理，不写文件、日志、监控或提示词原文。
+- `platform_screen.py`、`platform_vision.py`、`platform_screen_flow.py`（虚拟机画面）是在 main 接口上的可选扩展：请求不带 `screen` 且 `AIVIRTEACH_SCREEN_REQUESTS` 关闭时，处理、返回和事件必须与 main 完全相同；截图只在内存里处理，不写文件、日志、监控或提示词原文。
 - 不保存聊天、记忆或交付记录，这些归 Server。每次请求一个 DSH 会话，运行目录结束即删。
 - 身份、实验、工具范围来自 Server 的请求；学生消息、历史、课程资料、工具输出都是数据，不能扩大权限。工具只读，每次调用都计数和校验。
 - 保持有限的模型调用次数、输出、工具次数、并发和总超时；取消和超时要通知 DSH 停止。

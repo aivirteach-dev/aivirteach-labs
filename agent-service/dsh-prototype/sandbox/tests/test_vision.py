@@ -301,7 +301,9 @@ class PipelineTests(unittest.TestCase):
         event = next(d for e, d in frames if e == screen.SCREEN_ANALYZED)
         self.assertEqual((event["status"], event["code"]), ("failed", vision.SCREEN_ANALYSIS_FAILED))
         result = frames[-2][1]["response"]
-        self.assertEqual((result["status"], result["answer"]), ("completed", "好"))
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["answer"].startswith("好\n\n（这次没能查看"))  # 告诉学生画面没用上
+        self.assertEqual("".join(d["delta"] for e, d in frames if e == "assistant_delta"), result["answer"])
         self.assertIn(vision.SCREEN_ANALYSIS_FAILED, result["limitations"])
         self.assertNotIn("screen_findings", result)
 

@@ -146,7 +146,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((event["status"], event["code"]), ("skipped", screen.SCREEN_NOT_ANALYZED))
         self.assertTrue(set(names) - SCREEN_EVENTS <= CLIENT_EVENTS)
         result = frames[-2][1]["response"]
-        self.assertEqual((result["status"], result["answer"]), ("completed", "好"))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["answer"], "好\n\n（这次没能查看你发来的虚拟机画面，以上回答没有参考画面。）")
         self.assertIn(screen.SCREEN_NOT_ANALYZED, result["limitations"])
         self.assertNotIn("screen_findings", result)
         data = capture().data

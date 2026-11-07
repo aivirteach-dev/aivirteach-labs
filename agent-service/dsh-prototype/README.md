@@ -10,7 +10,7 @@
 
 与 main 逐字对应、由测试自动对比的部分：请求/返回格式（`platform_models.py`）、20 个只读工具的参数和授权校验（`platform_tools.py`）、脱敏（`platform_security.py`）、课程资料补充（`platform_course.py`）。SSE 事件名和帧格式、Gateway 错误码、证据编号（`obs-001`…）、工具调用次数上限也与 main 一致。
 
-### 扩展：虚拟机画面（开发中，已完成阶段 1、2）
+### 扩展：虚拟机画面（开发中，已完成阶段 1～3）
 
 学生同意后，Client 可以把 Guacamole 当前显示的 VM 桌面截图放进请求，Agent 据此判断学生停在哪个窗口、找不到哪个按钮。代码在 `platform_screen.py`，`platform_models.py` 仍是 main 的原样副本。
 
@@ -27,7 +27,14 @@
   - 限时：默认 12 秒，并保证看图之后还剩至少 20 秒给评估和回答，否则不看（`SCREEN_ANALYSIS_TIMEOUT`）。连接失败、超时、5xx 重试一次；其他失败记 `SCREEN_ANALYSIS_FAILED`，输出格式不对记 `SCREEN_ANALYSIS_INVALID`。看图失败不影响回答。
   - 减压：同一张图、同一个问题在 2 分钟内复用结果（不再调用模型）；每台 VM 每小时最多看 10 张（`SCREEN_RATE_LIMITED`），复用的结果不计。
   - 看图的 token 并入返回的 `usage`，Server 现有计费会算上；监控里是单独的 `chat <看图模型>` span（`aivirteach.phase` 为 `screen`），只有耗时和 token，没有图片和看图原文。
-  - 结果放进返回的 `screen_findings`（描述和标注位置）。阶段 2 还没有把看图结果交给评估和回答，这是阶段 3 的内容；评测是阶段 4。
+  - 结果放进返回的 `screen_findings`（描述和标注位置）。
+- 接入诊断（`platform_screen_flow.py`）：
+  - 问题按关键词分为界面类（按钮、菜单、点了没反应、只说“找不到 / 在哪”且没有环境类的词）、环境类（容器、端口、命令、连接）和其他，不额外调用模型。
+  - 有画面时，画面描述（窗口、页面、报错、相关元素的粗略位置如“右上”“底部中间”，不含坐标和图片）加进评估和收尾的用户消息，系统消息多一段使用规则；回答阶段仍只看校验过的评估（与 main 相同）。画面描述没有观察编号，评估 JSON 里引用了也会在 main 的校验之前去掉。
+  - 界面类问题评估阶段最多 2 次模型调用（画面或课程步骤已经说明学生在哪一步）。
+  - 回答末尾的说明：带了画面但没用上时说明原因（含密钥、次数用完、其他原因），说明也逐段推送。
+  - `AIVIRTEACH_SCREEN_REQUESTS=true` 时，界面类问题没有画面也按上面的方式减少调用，回答末尾提示学生发送画面，回答结束后发 `screen_requested` 事件。Client 支持截图之前保持关闭；关闭且不带画面时，处理、返回和事件与 main 完全相同。
+- 实测（DeepSeek 对话 + 看图、真实 DSH、假 Gateway、仓库教材、模拟截图）：界面问题带画面约 11 秒，回答直接指出“画布底部中间的橙色 Execute workflow 按钮”，标注位置落在按钮上；环境问题带画面约 12.5 秒，结合画面上的 Unable to connect 和教材里的目录、容器名、就绪检查给出步骤。评测（阶段 4）尚未做。
 
 ## 一次请求怎么跑
 
@@ -56,7 +63,7 @@
 
 沿用 main 的变量：`AIVIRTEACH_AGENT_TOKEN`、`AIVIRTEACH_AGENT_HOST`/`PORT`、`AIVIRTEACH_AGENT_CORS_ORIGINS`、`AIVIRTEACH_COURSE_DIR`、`AIVIRTEACH_GATEWAY_URL`、`AIVIRTEACH_DIAGNOSTIC_TOKEN`、`AIVIRTEACH_MODEL_PROVIDER`（`fake`、`ollama`、`openai_compatible`，默认 `fake`）、`AIVIRTEACH_MODEL_BASE_URL`（根地址如 `https://api.deepseek.com/` 会自动补 `/v1`）、`AIVIRTEACH_MODEL_API_KEY`、`AIVIRTEACH_MODEL_NAME`、`AIVIRTEACH_MODEL_THINKING`（只有 `enabled` 才开启思考）、`AIVIRTEACH_AGENT_TOTAL_TIMEOUT`（默认 40 秒，排队时间也计入）、`AIVIRTEACH_TOOL_TIMEOUT`（8）、`AIVIRTEACH_MAX_REASONING_TURNS`（4）、`AIVIRTEACH_MAX_TOOL_CALLS`（6，含被拒绝的调用）、`AIVIRTEACH_MAX_TOOL_OUTPUT_CHARS`（32768）、`AIVIRTEACH_MAX_CONCURRENT_REQUESTS`（4）。`AIVIRTEACH_MODEL_TIMEOUT` 不使用：DSH 由总超时和预算插件约束。
 
-看图（可选，不设模型名就不看图）：`AIVIRTEACH_VISION_MODEL_NAME`（例如 DeepSeek 的 `deepseek-flash`）、`AIVIRTEACH_VISION_MODEL_BASE_URL`（默认沿用 `AIVIRTEACH_MODEL_BASE_URL`）、`AIVIRTEACH_VISION_MODEL_API_KEY`（默认沿用 `AIVIRTEACH_MODEL_API_KEY`；本地 Ollama 等不需要密钥的可以都不设）、`AIVIRTEACH_VISION_TIMEOUT`（默认 12 秒，范围 3～30）、`AIVIRTEACH_SCREEN_MAX_PER_HOUR`（每台 VM 每小时最多看图次数，默认 10，0 表示不限）。地址不是根地址或 `/v1` 结尾时不看图，并在启动日志里提示。
+看图（可选，不设模型名就不看图）：`AIVIRTEACH_VISION_MODEL_NAME`（例如 DeepSeek 的 `deepseek-flash`）、`AIVIRTEACH_VISION_MODEL_BASE_URL`（默认沿用 `AIVIRTEACH_MODEL_BASE_URL`）、`AIVIRTEACH_VISION_MODEL_API_KEY`（默认沿用 `AIVIRTEACH_MODEL_API_KEY`；本地 Ollama 等不需要密钥的可以都不设）、`AIVIRTEACH_VISION_TIMEOUT`（默认 12 秒，范围 3～30）、`AIVIRTEACH_SCREEN_MAX_PER_HOUR`（每台 VM 每小时最多看图次数，默认 10，0 表示不限）、`AIVIRTEACH_SCREEN_REQUESTS`（`true` 时界面类问题没有画面也提示学生发送，默认关闭）。地址不是根地址或 `/v1` 结尾时不看图，并在启动日志里提示。
 
 DSH 专用：`AIVIRTEACH_DSH_CONTEXT_WINDOW`（32768）、`AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS`（4096）、`AIVIRTEACH_DSH_STATE_DIR`（每次请求的临时目录，结束即删）。关闭思考时固定发送 `reasoning_effort: none`（DeepSeek、Ollama 实测都接受）；运行账号由镜像的 `USER 1000`（`dsh-runner`）和 compose 的 `user` 保证。
 
@@ -77,6 +84,7 @@ python3 -m venv .venv
 - `sandbox/tests/test_deploy_config.py`：部署文件的安全设置；`promtool`、`amtool`、`otelcol-contrib` 在 PATH 时还检查告警规则（含 `deploy/alerts.test.yml`）和配置。
 - `sandbox/tests/test_telemetry.py`：监控 span 的结构、属性、token 换算、失败标记和隐私默认值（内存导出，不需要 Phoenix）。
 - `sandbox/tests/test_screen.py`：虚拟机画面的请求和返回格式、图片检查（每种不合格情况的原因码、特制的大尺寸文件头）、缩略和裁剪、没有截图时返回与 main 相同、422 不回显截图、请求体上限。
+- `sandbox/tests/test_screen_flow.py`：问题分类、提示词里的画面描述、界面类问题的调用上限、画面引用不影响 main 的校验、收尾阶段、回答末尾的说明和 `screen_requested` 事件、开关关闭且不带画面时与 main 相同。
 - `sandbox/tests/test_vision.py`：看图的请求格式、整屏 → 放大两次看图和坐标换算、密钥过滤、输出格式错误、HTTP 错误和重试、超时和取消、结果复用、每台 VM 的次数限制、接入请求流程、用量合并、监控里不含图片和看图原文（看图模型用 httpx 的模拟传输，不连真实模型）。
 
 ## 实测（本地，假 Gateway）

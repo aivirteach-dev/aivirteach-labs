@@ -34,9 +34,11 @@ from .platform_assessment import (MAX_ANSWER_CHARS, answer_prompt, assessment_fa
 from .platform_models import (CourseAlignment, DiagnoseRequest, Diagnosis, DiagnosticAssessment,
                               Evidence, ToolTrace, Usage)
 from .platform_runtime import DshSettings, RunOutcome, run_once
-from .platform_screen import (SCREEN_ANALYZED, SCREEN_ANALYZING, SCREEN_NOT_ANALYZED, BodySizeLimit,
+from .platform_screen import (SCREEN_ANALYZED, SCREEN_ANALYZING, SCREEN_NOT_ANALYZED, SCREEN_REQUESTED, BodySizeLimit,
                               ScreenDiagnoseRequest, ScreenDiagnoseResponse, ScreenFindings, ScreenRejected,
                               load_screen, validation_error_handler)
+from .platform_screen_flow import (UI, UI_ASSESSMENT_MODEL_CALLS, answer_note, classify_question,
+                                   drop_screen_reference, with_screen)
 from .platform_vision import (SCREEN_ANALYSIS_FAILED, SCREEN_ANALYSIS_TIMEOUT, Perception, ScreenAnalyzer,
                               VisionSettings)
 from .telemetry import RequestTrace, Telemetry, provider_name
@@ -100,6 +102,8 @@ class Settings:
     vision_api_key_env: Optional[str] = None
     vision_timeout_seconds: int = 12
     screen_max_per_hour: int = 10
+    # 界面类问题没有画面时，回答末尾提示学生发送画面。Client 支持截图之前保持关闭。
+    screen_requests: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -132,6 +136,7 @@ class Settings:
             vision_api_key_env=vision_key_env,
             vision_timeout_seconds=_int_env("AIVIRTEACH_VISION_TIMEOUT", 12, 3, 30),
             screen_max_per_hour=_int_env("AIVIRTEACH_SCREEN_MAX_PER_HOUR", 10, 0, 120),
+            screen_requests=os.getenv("AIVIRTEACH_SCREEN_REQUESTS", "").strip().lower() in ("1", "true", "yes"),
         )
 
     def vision(self) -> VisionSettings:
@@ -249,7 +254,9 @@ class PipelineOutcome:
     calls: list = field(default_factory=list)
     tool_events: list = field(default_factory=list)
     screen_findings: Optional[ScreenFindings] = None  # 返回给 Server 的看图结果
-    perception: Optional[Perception] = None  # 完整的看图结果（窗口、页面、报错），后续阶段交给评估使用
+    perception: Optional[Perception] = None  # 完整的看图结果（窗口、页面、报错），交给评估使用
+    screen_codes: list = field(default_factory=list)  # 截图没用上时的原因码
+    question_kind: str = ""  # ui / environment / other（platform_screen_flow.classify_question）
 
 
 class Diagnoser:
@@ -292,14 +299,25 @@ class Diagnoser:
             return outcome
 
         # 0. 虚拟机画面：检查截图，再交给看图模型；失败不影响后面的诊断和回答。
-        screen_limitations = self._screen(request, stage, deadline, cancel, result)
+        result.screen_codes = self._screen(request, stage, deadline, cancel, result)
+        result.question_kind = classify_question(request.question)
+        perception = result.perception
+
+        def with_view(prompts: tuple) -> tuple:  # 有画面描述时加进评估和收尾的提示词
+            return with_screen(prompts, perception, request.response_language) if perception else prompts
+
+        # 界面类问题：画面或课程步骤已经说明学生在哪一步，评估最多 2 次模型调用，不做多轮工具检查。
+        # 只在带了画面、或已打开 AIVIRTEACH_SCREEN_REQUESTS 时这样做；否则与 main 完全相同。
+        ui_mode = result.question_kind == UI and (getattr(request, "screen", None) is not None
+                                                 or self.settings.screen_requests)
+        assessment_calls = min(UI_ASSESSMENT_MODEL_CALLS, self.settings.max_reasoning_turns) if ui_mode else None
 
         # 1. 评估：可以调工具，最后只输出评估 JSON；文字不推送给学生。
         stage("reasoning_started", {"turn": 1})
-        text, limitations, partial, budget_stop = None, screen_limitations, False, None
+        text, limitations, partial, budget_stop = None, list(result.screen_codes), False, None
         try:
-            assessed = run("assessment", assessment_prompt(request),
-                           self.settings.tools(request, max(1, int(deadline - time.monotonic()))), None)
+            assessed = run("assessment", with_view(assessment_prompt(request)),
+                           self.settings.tools(request, max(1, int(deadline - time.monotonic()))), assessment_calls)
             result.evidence, result.tool_trace = list(assessed.evidence), list(assessed.tool_trace)
             limitations.extend(assessed.limitations)
             partial, budget_stop = assessed.partial, assessed.budget_stop
@@ -323,7 +341,7 @@ class Diagnoser:
             limitations.append("REASONING_TURN_BUDGET_EXHAUSTED")
             stage("finalization_started", {"reason": "reasoning_turn_budget_exhausted"})
             try:
-                final = run("finalization", finalization_prompt(request, result.evidence), None, 1)
+                final = run("finalization", with_view(finalization_prompt(request, result.evidence)), None, 1)
                 if final.error:
                     limitations.append(final.error)
                 else:
@@ -334,8 +352,10 @@ class Diagnoser:
             if cancel.is_set():
                 return result
 
-        # 3. 校验：结构不对或引用了不存在的证据就不写回答。
+        # 3. 校验：结构不对或引用了不存在的证据就不写回答。画面没有观察编号，先去掉对它的引用。
         stage("assessment_validating")
+        if perception:
+            text = drop_screen_reference(text)
         assessment, evidence, limitations, partial = validate(text, result.evidence, limitations, partial)
         result.assessment, result.evidence, result.limitations, result.partial = assessment, evidence, limitations, partial
         if assessment is None:
@@ -468,8 +488,16 @@ class Diagnoser:
         assessment = outcome.assessment
         details = {"evidence": outcome.evidence, "tool_trace": outcome.tool_trace, "assessment": assessment,
                    "screen_findings": outcome.screen_findings}
+        screen_attached = getattr(request, "screen", None) is not None
+        note = answer_note(screen_attached=screen_attached, screen_used=outcome.perception is not None,
+                           screen_codes=outcome.screen_codes, kind=outcome.question_kind,
+                           requests_enabled=self.settings.screen_requests, language=request.response_language)
+        # 界面类问题没有画面：回答结束后告诉 Client 可以请学生发送画面（开关打开时）。
+        request_screen = outcome.question_kind == UI and not screen_attached and self.settings.screen_requests
         if assessment is None:  # ASSESSMENT_INVALID 已经推送；与 main 一样只返回兜底文字
-            return self._response(request, None, limitations, usage, **details)
+            if request_screen:
+                await emit(SCREEN_REQUESTED, {"reason": "ui_question"})
+            return self._response(request, None, limitations, usage, note=note, **details)
         answer = (outcome.answer or "".join(streamed)).strip()
         error = outcome.answer_error
         if len(answer) > MAX_ANSWER_CHARS:
@@ -485,19 +513,28 @@ class Diagnoser:
             await emit("answer_failed", {"code": failure})
             await emit("answer_finished", {"status": "fallback", "character_count": len("".join(streamed)),
                                            "finish_reason": outcome.answer_finish or "unknown"})
+            if request_screen:
+                await emit(SCREEN_REQUESTED, {"reason": "ui_question"})
             fallback = assessment_fallback(assessment, request.response_language)
-            return self._response(request, fallback, [*limitations, failure], usage, **details)
+            return self._response(request, fallback, [*limitations, failure], usage, note=note, **details)
+        if note:  # 说明也逐段推送，学生看到的和保存的回答一致
+            note = "\n\n" + note
+            await emit("assistant_delta", {"delta": note})
+            answer += note
         await emit("answer_finished", {"status": "completed", "character_count": len(answer), "finish_reason": "stop"})
+        if request_screen:
+            await emit(SCREEN_REQUESTED, {"reason": "ui_question"})
         return self._response(request, answer, limitations, usage, completed=not outcome.partial, **details)
 
     @staticmethod
     def _response(request, answer, limitations, usage, completed=False, evidence=(), tool_trace=(),
                   assessment: Optional[DiagnosticAssessment] = None,
-                  screen_findings: Optional[ScreenFindings] = None) -> ScreenDiagnoseResponse:
+                  screen_findings: Optional[ScreenFindings] = None, note: str = "") -> ScreenDiagnoseResponse:
+        answer = answer or assessment_fallback(None, request.response_language)
         return ScreenDiagnoseResponse(
             request_id=request.request_id,
             status="completed" if completed and assessment is not None else "partial",
-            answer=answer or assessment_fallback(None, request.response_language),
+            answer=answer + ("\n\n" + note if note else ""),
             diagnosis=assessment.diagnosis if assessment else Diagnosis(),
             course_alignment=assessment.course_alignment if assessment else CourseAlignment(),
             evidence=[Evidence.model_validate(item) for item in evidence],
