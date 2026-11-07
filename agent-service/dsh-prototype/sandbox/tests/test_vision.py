@@ -31,7 +31,7 @@ USAGE = {"prompt_tokens": 1100, "completion_tokens": 90, "total_tokens": 1190,
 def perception(**overrides):
     value = {"readable": True, "window": "browser", "app": "Firefox", "page": "n8n - Overview",
              "summary": "学生在 n8n 首页，右上角有 Create Workflow 按钮。", "visible_errors": [],
-             "elements": [{"label": "Create Workflow", "x": 0.82, "y": 0.04, "width": 0.12, "height": 0.05}],
+             "elements": [{"label": "Create Workflow", "x": 1050, "y": 32, "width": 154, "height": 40}],
              "zoom": None, "contains_sensitive": False}
     value.update(overrides)
     return value
@@ -118,9 +118,13 @@ class AnalyzerTests(unittest.TestCase):
         self.assertIn("不要抄录任何密钥", system["content"]); self.assertIn("用 中文 写", system["content"])
         self.assertEqual(user["content"][0]["type"], "text")
         self.assertIn("找不到 Create Workflow 按钮", user["content"][0]["text"])
+        self.assertEqual(json.loads(user["content"][0]["text"])["image_size"], {"width": 1280, "height": 800})
+        self.assertIn("坐标都用这张图片的像素", system["content"])
         self.assertEqual(fake.images()[0].size, (1280, 800))  # 整屏缩略图
         findings = result.findings
-        self.assertEqual(findings.highlights[0].label, "Create Workflow")
+        box = findings.highlights[0]
+        self.assertEqual((box.label, box.x, box.y, box.width, box.height),
+                         ("Create Workflow", 0.8203, 0.04, 0.1203, 0.05))  # 像素换成比例
         self.assertIn("Create Workflow", findings.summary)
         [call] = result.calls
         self.assertEqual((call.phase, call.model, call.finish, call.error), ("screen", "vision-test", "stop", None))
@@ -128,23 +132,25 @@ class AnalyzerTests(unittest.TestCase):
                                          "totalTokens": 1190}])
 
     def test_unreadable_region_is_zoomed_once_and_mapped_back(self):
-        zoom = {"x": 0.5, "y": 0.0, "width": 0.5, "height": 0.4}
+        zoom = {"x": 640, "y": 0, "width": 640, "height": 320}  # 整屏缩略图（1280×800）的右上区域
         fake = FakeVision(perception(readable=False, zoom=zoom, summary="右上角的字太小。"),
                           perception(summary="放大后能看到 Create Workflow 按钮。", visible_errors=["Bad request"],
-                                     elements=[{"label": "Create Workflow", "x": 0.5, "y": 0.5, "width": 0.2,
-                                                "height": 0.1}]))
+                                     elements=[{"label": "Create Workflow", "x": 500, "y": 250, "width": 200,
+                                                "height": 50}]))
         result = analyze(analyzer(fake))
         self.assertEqual((result.status, result.passes), ("ok", 2))
         overview, crop = fake.images()
         self.assertEqual(crop.size, (1000, 500))  # 从 2000×1250 的原图裁出，原尺寸不缩小
-        self.assertIn("右上角的字太小。", fake.bodies()[1]["messages"][1]["content"][0]["text"])
+        second_text = fake.bodies()[1]["messages"][1]["content"][0]["text"]
+        self.assertIn("右上角的字太小。", second_text)
+        self.assertIn('"image_size": {"width": 1000, "height": 500}', second_text)
         box = result.findings.highlights[0]
         self.assertEqual((box.x, box.y, box.width, box.height), (0.75, 0.2, 0.1, 0.04))  # 换回整张图的坐标
         self.assertEqual(result.perception.visible_errors, ["Bad request"])
         self.assertEqual(result.findings.summary, "放大后能看到 Create Workflow 按钮。")
 
     def test_failed_zoom_keeps_the_first_result(self):
-        zoom = {"x": 0.5, "y": 0.0, "width": 0.5, "height": 0.4}
+        zoom = {"x": 640, "y": 0, "width": 640, "height": 320}
         fake = FakeVision(perception(readable=False, zoom=zoom, summary="右上角的字太小。"), httpx.Response(400))
         result = analyze(analyzer(fake))
         self.assertEqual((result.status, result.code, result.passes), ("ok", None, 2))
@@ -178,18 +184,23 @@ class AnalyzerTests(unittest.TestCase):
             result = analyze(analyzer(FakeVision(content)))
             self.assertEqual((result.status, result.code), ("failed", vision.SCREEN_ANALYSIS_INVALID), content)
 
-    def test_fenced_json_and_bad_boxes(self):
-        boxes = [{"label": "ok", "x": 0.1, "y": 0.1, "width": 0.2, "height": 0.1},
-                 {"label": "像素坐标", "x": 640, "y": 20, "width": 120, "height": 40},
-                 {"label": "缺字段", "x": 0.1},
-                 {"label": "超出右边", "x": 0.9, "y": 0.1, "width": 0.3, "height": 0.1},
-                 *[{"label": f"多余{i}", "x": 0.01 * i, "y": 0.5, "width": 0.01, "height": 0.01} for i in range(1, 6)]]
+    def test_fenced_json_and_box_normalization(self):
+        boxes = [{"label": "像素", "x": 640, "y": 20, "width": 120, "height": 40},
+                 {"label": "缺字段", "x": 10},
+                 {"label": "负数", "x": -5, "y": 20, "width": 120, "height": 40},
+                 {"label": "超出右边", "x": 1200, "y": 400, "width": 200, "height": 40},
+                 {"label": "在图外", "x": 1300, "y": 400, "width": 20, "height": 20},
+                 {"label": "仍给比例", "x": 0.9, "y": 0.1, "width": 0.3, "height": 0.1},
+                 *[{"label": f"多余{i}", "x": 10 * i, "y": 500, "width": 8, "height": 8} for i in range(1, 6)]]
         content = "```json\n" + json.dumps(perception(window="spaceship", elements=boxes), ensure_ascii=False) + "\n```"
         result = analyze(analyzer(FakeVision(content)))
         self.assertEqual(result.status, "ok")
-        labels = [h.label for h in result.perception.elements]
-        self.assertEqual(labels, ["ok", "超出右边", "多余1", "多余2", "多余3"])  # 超出的裁到图内；最多 5 个
-        self.assertAlmostEqual(result.perception.elements[1].width, 0.1)
+        elements = result.perception.elements
+        self.assertEqual([h.label for h in elements], ["像素", "超出右边", "仍给比例", "多余1", "多余2"])  # 最多 5 个
+        self.assertEqual((elements[0].x, elements[0].y, elements[0].width, elements[0].height),
+                         (0.5, 0.025, 0.0938, 0.05))
+        self.assertAlmostEqual(elements[1].width, 0.0625)  # 裁到图内
+        self.assertAlmostEqual(elements[2].width, 0.1)
         self.assertEqual(result.perception.window, "other")
 
     def test_http_errors_and_retries(self):
