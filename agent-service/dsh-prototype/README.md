@@ -10,6 +10,18 @@
 
 与 main 逐字对应、由测试自动对比的部分：请求/返回格式（`platform_models.py`）、20 个只读工具的参数和授权校验（`platform_tools.py`）、脱敏（`platform_security.py`）、课程资料补充（`platform_course.py`）。SSE 事件名和帧格式、Gateway 错误码、证据编号（`obs-001`…）、工具调用次数上限也与 main 一致。
 
+### 扩展：虚拟机画面（开发中，目前完成阶段 1）
+
+学生同意后，Client 可以把 Guacamole 当前显示的 VM 桌面截图放进请求，Agent 据此判断学生停在哪个窗口、找不到哪个按钮。代码在 `platform_screen.py`，`platform_models.py` 仍是 main 的原样副本。
+
+- 请求可选字段 `screen`：`source`（固定 `vm_console`）、`mime_type`（`image/png`、`image/jpeg`、`image/webp`）、`data`（标准 base64，不带 `data:` 前缀）、`width`、`height`、`captured_at`。
+- 返回可选字段 `screen_findings`：`summary` 和最多 5 个 `highlights`（按比例的坐标 `x`、`y`、`width`、`height`，0～1）。没有结果时返回里不出现这个字段。
+- 新增 SSE 事件 `screen_analyzing`、`screen_analyzed`（`status` 为 `ok` / `skipped` / `rejected` / `failed`，带原因码）、`screen_requested`。现在的 Client 不认识这些事件，会直接忽略。
+- 兼容性：Server 不发 `screen` 时，请求处理、返回内容和事件与 main 完全相同。Server 用 zod 校验返回，不认识的字段会被去掉，不会出错。
+- 检查：先按文件头判断格式和尺寸，再完整解码。解码后最大 3 MB、单边最大 2560、总像素最多 2560×1600、不接受动图、声明的宽高必须与实际一致。不合格时不影响回答，只在 `limitations` 里记原因码（`SCREEN_INVALID_BASE64`、`SCREEN_TOO_LARGE`、`SCREEN_FORMAT_MISMATCH`、`SCREEN_DIMENSIONS_TOO_LARGE`、`SCREEN_DIMENSIONS_MISMATCH`、`SCREEN_ANIMATED`、`SCREEN_UNREADABLE`）。
+- 隐私：截图只在内存里处理，不写文件、日志和监控，也不进任何提示词；`screen` 下的 422 错误不回显输入；超过 6 MB 的请求体在解析前返回 413。
+- 阶段 1 还没有接入看图模型：合格的截图只做检查，记 `SCREEN_NOT_ANALYZED`。看图（阶段 2）、接入诊断流程（阶段 3）、评测（阶段 4）尚未完成。
+
 ## 一次请求怎么跑
 
 1. `platform_app.py`：鉴权、排队（并发上限），在工作线程里按 main 的流程依次运行各阶段，把过程事件转成 SSE：
@@ -55,6 +67,7 @@ python3 -m venv .venv
 - `sandbox/tests/test_model_budget.mjs`：预算插件单元测试。
 - `sandbox/tests/test_deploy_config.py`：部署文件的安全设置；`promtool`、`amtool`、`otelcol-contrib` 在 PATH 时还检查告警规则（含 `deploy/alerts.test.yml`）和配置。
 - `sandbox/tests/test_telemetry.py`：监控 span 的结构、属性、token 换算、失败标记和隐私默认值（内存导出，不需要 Phoenix）。
+- `sandbox/tests/test_screen.py`：虚拟机画面的请求和返回格式、图片检查（每种不合格情况的原因码、特制的大尺寸文件头）、缩略和裁剪、没有截图时返回与 main 相同、422 不回显截图、请求体上限。
 
 ## 实测（本地，假 Gateway）
 

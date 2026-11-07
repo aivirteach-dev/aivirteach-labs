@@ -2,6 +2,7 @@
 
 接口、请求/返回格式、鉴权、SSE 事件名与帧格式、环境变量均以 agent-service/aivirteach_agent
 为准，Server 和 Client 不需要任何改动。启动见 start_platform.sh。
+唯一的扩展是可选的虚拟机画面（请求 screen / 返回 screen_findings，见 platform_screen.py）；不带时与 main 相同。
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -29,9 +31,12 @@ from .platform_course import CourseRepository
 from .platform_mcp import ToolContext
 from .platform_assessment import (MAX_ANSWER_CHARS, answer_prompt, assessment_fallback, assessment_prompt,
                                   finalization_prompt, is_answer_stage, validate)
-from .platform_models import (CourseAlignment, DiagnoseRequest, DiagnoseResponse, Diagnosis, DiagnosticAssessment,
+from .platform_models import (CourseAlignment, DiagnoseRequest, Diagnosis, DiagnosticAssessment,
                               Evidence, ToolTrace, Usage)
 from .platform_runtime import DshSettings, RunOutcome, run_once
+from .platform_screen import (SCREEN_ANALYZED, SCREEN_NOT_ANALYZED, BodySizeLimit, ScreenDiagnoseRequest,
+                              ScreenDiagnoseResponse, ScreenFindings, ScreenRejected, load_screen,
+                              validation_error_handler)
 from .telemetry import RequestTrace, Telemetry, provider_name
 
 LOG = logging.getLogger("aivirteach.dsh_agent")
@@ -215,6 +220,7 @@ class PipelineOutcome:
     usage: list = field(default_factory=list)
     calls: list = field(default_factory=list)
     tool_events: list = field(default_factory=list)
+    screen_findings: Optional[ScreenFindings] = None  # 看图结果（看图模型接入前始终为空）
 
 
 class Diagnoser:
@@ -226,7 +232,8 @@ class Diagnoser:
         self.telemetry = telemetry or Telemetry()
         self.slots = asyncio.Semaphore(settings.max_concurrent_requests)
 
-    async def diagnose(self, request: DiagnoseRequest, publish: Optional[Publish] = None) -> DiagnoseResponse:
+    async def diagnose(self, request: ScreenDiagnoseRequest,
+                       publish: Optional[Publish] = None) -> ScreenDiagnoseResponse:
         trace, response = RequestTrace(), None
         try:
             response = await self._diagnose(request, publish, trace)
@@ -234,7 +241,7 @@ class Diagnoser:
         finally:  # 调用方断开时 response 为 None，监控记为 CLIENT_DISCONNECTED
             self.telemetry.record(request, response, trace, stream=publish is not None)
 
-    def _pipeline(self, request: DiagnoseRequest, deadline: float, on_event: Callable[[str, dict], None],
+    def _pipeline(self, request: ScreenDiagnoseRequest, deadline: float, on_event: Callable[[str, dict], None],
                   cancel: threading.Event) -> PipelineOutcome:
         """在工作线程里依次运行各阶段；阶段事件经 on_event("stage", ...) 交给 SSE。各阶段共用总时限。"""
         result = PipelineOutcome()
@@ -253,9 +260,12 @@ class Diagnoser:
             result.tool_events.extend(outcome.tool_events)
             return outcome
 
+        # 0. 虚拟机画面：先检查；看图模型接入前，合格的截图也只记 SCREEN_NOT_ANALYZED。
+        screen_limitations = self._check_screen(request, stage)
+
         # 1. 评估：可以调工具，最后只输出评估 JSON；文字不推送给学生。
         stage("reasoning_started", {"turn": 1})
-        text, limitations, partial, budget_stop = None, [], False, None
+        text, limitations, partial, budget_stop = None, screen_limitations, False, None
         try:
             assessed = run("assessment", assessment_prompt(request),
                            self.settings.tools(request, max(1, int(deadline - time.monotonic()))), None)
@@ -312,8 +322,23 @@ class Diagnoser:
             result.answer_error = "MODEL_STREAM_ERROR"
         return result
 
-    async def _diagnose(self, request: DiagnoseRequest, publish: Optional[Publish],
-                        trace: RequestTrace) -> DiagnoseResponse:
+    @staticmethod
+    def _check_screen(request: ScreenDiagnoseRequest, stage: Callable[..., None]) -> list:
+        """检查请求里的截图，返回要记进 limitations 的原因码。截图不合格不影响回答，只是不看图。"""
+        capture = getattr(request, "screen", None)
+        if capture is None:
+            return []
+        try:
+            loaded = load_screen(capture)
+        except ScreenRejected as rejected:
+            stage(SCREEN_ANALYZED, {"status": "rejected", "code": rejected.code})
+            return [rejected.code]
+        loaded.close()
+        stage(SCREEN_ANALYZED, {"status": "skipped", "code": SCREEN_NOT_ANALYZED})
+        return [SCREEN_NOT_ANALYZED]
+
+    async def _diagnose(self, request: ScreenDiagnoseRequest, publish: Optional[Publish],
+                        trace: RequestTrace) -> ScreenDiagnoseResponse:
         async def emit(event: str, data: dict) -> None:
             if publish is not None:
                 await publish(event, data)
@@ -385,7 +410,8 @@ class Diagnoser:
         limitations = _unique([*limitations, *outcome.limitations])
         usage = normalize_usage(outcome.usage, self.settings.model_provider)
         assessment = outcome.assessment
-        details = {"evidence": outcome.evidence, "tool_trace": outcome.tool_trace, "assessment": assessment}
+        details = {"evidence": outcome.evidence, "tool_trace": outcome.tool_trace, "assessment": assessment,
+                   "screen_findings": outcome.screen_findings}
         if assessment is None:  # ASSESSMENT_INVALID 已经推送；与 main 一样只返回兜底文字
             return self._response(request, None, limitations, usage, **details)
         answer = (outcome.answer or "".join(streamed)).strip()
@@ -410,8 +436,9 @@ class Diagnoser:
 
     @staticmethod
     def _response(request, answer, limitations, usage, completed=False, evidence=(), tool_trace=(),
-                  assessment: Optional[DiagnosticAssessment] = None) -> DiagnoseResponse:
-        return DiagnoseResponse(
+                  assessment: Optional[DiagnosticAssessment] = None,
+                  screen_findings: Optional[ScreenFindings] = None) -> ScreenDiagnoseResponse:
+        return ScreenDiagnoseResponse(
             request_id=request.request_id,
             status="completed" if completed and assessment is not None else "partial",
             answer=answer or assessment_fallback(None, request.response_language),
@@ -422,6 +449,7 @@ class Diagnoser:
             tool_trace=[ToolTrace.model_validate(item) for item in tool_trace],
             limitations=_unique(limitations),
             usage=usage,
+            screen_findings=screen_findings,
         )
 
 
@@ -451,6 +479,8 @@ def create_app(*, settings: Optional[Settings] = None, runner: Optional[Runner] 
     app.add_middleware(CORSMiddleware, allow_origins=[o.strip().rstrip("/") for o in origins.split(",") if o.strip()],
                        allow_credentials=False, allow_methods=["POST", "OPTIONS"],
                        allow_headers=["Authorization", "Content-Type"])
+    app.add_middleware(BodySizeLimit)  # 带截图的请求约 4 MB；更大的请求体在解析前就拒绝
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
 
     async def require_agent_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(agent_bearer)) -> None:
         if not config.agent_token:
@@ -476,15 +506,15 @@ def create_app(*, settings: Optional[Settings] = None, runner: Optional[Runner] 
         return {"status": "ready", "provider": config.model_provider,
                 "diagnostic_gateway_configured": True, "processed_courses": courses.course_count}
 
-    @app.post("/v1/agent/diagnose", response_model=DiagnoseResponse,
+    @app.post("/v1/agent/diagnose", response_model=ScreenDiagnoseResponse,
               dependencies=[Depends(require_agent_token)], tags=["agent"])
-    async def diagnose(request: DiagnoseRequest) -> DiagnoseResponse:
+    async def diagnose(request: ScreenDiagnoseRequest) -> ScreenDiagnoseResponse:
         require_ready()
         return await diagnoser.diagnose(request)
 
     @app.post("/v1/agent/diagnose/stream", response_class=StreamingResponse,
               dependencies=[Depends(require_agent_token)], tags=["agent"])
-    async def diagnose_stream(request: DiagnoseRequest) -> StreamingResponse:
+    async def diagnose_stream(request: ScreenDiagnoseRequest) -> StreamingResponse:
         require_ready()
         request_id = str(request.request_id)
         queue: asyncio.Queue = asyncio.Queue(maxsize=256)
