@@ -182,14 +182,15 @@ class Telemetry:
         context = otel_trace.set_span_in_context(root)
 
         for call in calls:
-            span = self.tracer.start_span(f"chat {self.model}", context=context, kind=SpanKind.CLIENT,
+            model = getattr(call, "model", "") or self.model  # 看图调用用的是单独配置的模型
+            span = self.tracer.start_span(f"chat {model}", context=context, kind=SpanKind.CLIENT,
                                           start_time=_ns(call.start_ms), attributes={
                                               "openinference.span.kind": "LLM",
                                               "gen_ai.operation.name": "chat",
                                               "gen_ai.provider.name": self.provider_name,
-                                              "gen_ai.request.model": self.model,
+                                              "gen_ai.request.model": model,
                                               "llm.provider": self.provider_name,
-                                              "llm.model_name": self.model,
+                                              "llm.model_name": model,
                                               "aivirteach.call": call.call,
                                               "aivirteach.phase": getattr(call, "phase", "") or "unknown",
                                               **_usage_attributes(call.usage)})

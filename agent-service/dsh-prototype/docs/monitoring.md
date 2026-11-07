@@ -9,7 +9,7 @@ Agent 按 OpenTelemetry 标准发送监控数据（`dsh_tutor/telemetry.py`）�
 | span | 类型 | 内容 |
 |---|---|---|
 | `invoke_agent aivirteach-tutor` | AGENT | 整个请求：request_id、lab_id、课程和课时、是否流式、返回状态、限制码、模型调用次数、工具调用次数、排队时间、首字延迟、总耗时 |
-| `chat <模型>` | LLM | 每次模型调用：所属阶段（`aivirteach.phase`：assessment / finalization / answer）、连接类错误后的重试次数（`aivirteach.retries`）、耗时、首字延迟、输入/输出/缓存命中 token、结束原因、失败原因（含提供方返回的 error / aborted） |
+| `chat <模型>` | LLM | 每次模型调用：所属阶段（`aivirteach.phase`：screen（看图，span 名用看图模型的名字）/ assessment / finalization / answer）、连接类错误后的重试次数（`aivirteach.retries`）、耗时、首字延迟、输入/输出/缓存命中 token、结束原因、失败原因（含提供方返回的 error / aborted） |
 | `execute_tool <工具>` | TOOL | 每次工具调用：耗时、结果状态（ok/cached/denied/error）、错误码、证据编号 |
 
 - 时间来自事件文件里的毫秒时间戳，请求结束后一次性补记，不拖慢回答。超时或调用方断开时，等 DSH 真正停下再记，所以这些情况也能看到每次调用的情况。

@@ -66,6 +66,7 @@ class ModelCall:
     usage: Optional[dict] = None
     phase: str = ""  # assessment / finalization / answer，由 Diagnoser 填写
     retries: int = 0  # 连接类错误后的重试次数（预算插件最多重试一次）
+    model: str = ""  # 与对话模型不同时填写（例如看图模型）
 
 
 @dataclass

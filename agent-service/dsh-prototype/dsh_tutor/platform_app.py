@@ -34,14 +34,20 @@ from .platform_assessment import (MAX_ANSWER_CHARS, answer_prompt, assessment_fa
 from .platform_models import (CourseAlignment, DiagnoseRequest, Diagnosis, DiagnosticAssessment,
                               Evidence, ToolTrace, Usage)
 from .platform_runtime import DshSettings, RunOutcome, run_once
-from .platform_screen import (SCREEN_ANALYZED, SCREEN_NOT_ANALYZED, BodySizeLimit, ScreenDiagnoseRequest,
-                              ScreenDiagnoseResponse, ScreenFindings, ScreenRejected, load_screen,
-                              validation_error_handler)
+from .platform_screen import (SCREEN_ANALYZED, SCREEN_ANALYZING, SCREEN_NOT_ANALYZED, BodySizeLimit,
+                              ScreenDiagnoseRequest, ScreenDiagnoseResponse, ScreenFindings, ScreenRejected,
+                              load_screen, validation_error_handler)
+from .platform_vision import (SCREEN_ANALYSIS_FAILED, SCREEN_ANALYSIS_TIMEOUT, Perception, ScreenAnalyzer,
+                              VisionSettings)
 from .telemetry import RequestTrace, Telemetry, provider_name
 
 LOG = logging.getLogger("aivirteach.dsh_agent")
 SSE_HEARTBEAT_SECONDS = 10
 API_KEY_ENV = "AIVIRTEACH_MODEL_API_KEY"
+VISION_API_KEY_ENV = "AIVIRTEACH_VISION_MODEL_API_KEY"
+# 看图之后至少给评估和回答留这么多秒；剩余时间不够就不看图（SCREEN_ANALYSIS_TIMEOUT）。
+TIME_AFTER_SCREEN_SECONDS = 20
+MIN_SCREEN_BUDGET_SECONDS = 3
 # 与 main 的 DEFAULT_COURSE_DIRECTORY 相同（agent-service/.cache/...）。
 DEFAULT_COURSE_DIRECTORY = Path(__file__).resolve().parents[2] / ".cache" / "course" / "AI Daily Briefing" / "processed"
 
@@ -88,13 +94,22 @@ class Settings:
     max_reasoning_turns: int = 4
     max_tool_calls: int = 6
     max_tool_output_chars: int = 32_768
+    # 看图模型（可选，与对话模型分开配置；模型名为空表示不看图）
+    vision_model: str = ""
+    vision_base_url: str = ""
+    vision_api_key_env: Optional[str] = None
+    vision_timeout_seconds: int = 12
+    screen_max_per_hour: int = 10
 
     @classmethod
     def from_env(cls) -> "Settings":
+        base_url = normalize_base_url(os.getenv("AIVIRTEACH_MODEL_BASE_URL", ""))
+        vision_key_env = (VISION_API_KEY_ENV if os.getenv(VISION_API_KEY_ENV)
+                          else API_KEY_ENV if os.getenv(API_KEY_ENV) else None)
         return cls(
             agent_token=os.getenv("AIVIRTEACH_AGENT_TOKEN", ""),
             model_provider=os.getenv("AIVIRTEACH_MODEL_PROVIDER", "fake").strip().lower(),
-            model_base_url=normalize_base_url(os.getenv("AIVIRTEACH_MODEL_BASE_URL", "")),
+            model_base_url=base_url,
             model_name=os.getenv("AIVIRTEACH_MODEL_NAME", ""),
             model_api_key_set=bool(os.getenv(API_KEY_ENV)),
             model_thinking=os.getenv("AIVIRTEACH_MODEL_THINKING", "").strip().lower(),
@@ -111,7 +126,20 @@ class Settings:
             max_reasoning_turns=_int_env("AIVIRTEACH_MAX_REASONING_TURNS", 4, 1, 8),
             max_tool_calls=_int_env("AIVIRTEACH_MAX_TOOL_CALLS", 6, 1, 12),
             max_tool_output_chars=_int_env("AIVIRTEACH_MAX_TOOL_OUTPUT_CHARS", 32_768, 1_024, 65_536),
+            # 看图：地址和密钥默认沿用对话模型的配置。
+            vision_model=os.getenv("AIVIRTEACH_VISION_MODEL_NAME", "").strip(),
+            vision_base_url=normalize_base_url(os.getenv("AIVIRTEACH_VISION_MODEL_BASE_URL", "")) or base_url,
+            vision_api_key_env=vision_key_env,
+            vision_timeout_seconds=_int_env("AIVIRTEACH_VISION_TIMEOUT", 12, 3, 30),
+            screen_max_per_hour=_int_env("AIVIRTEACH_SCREEN_MAX_PER_HOUR", 10, 0, 120),
         )
+
+    def vision(self) -> VisionSettings:
+        valid = urlsplit(self.vision_base_url).scheme in ("http", "https") and \
+            urlsplit(self.vision_base_url).path == "/v1"
+        return VisionSettings(model=self.vision_model if valid else "", base_url=self.vision_base_url,
+                              api_key_env=self.vision_api_key_env, timeout_seconds=self.vision_timeout_seconds,
+                              max_per_hour=self.screen_max_per_hour)
 
     def readiness_errors(self) -> list:
         errors = []
@@ -220,16 +248,19 @@ class PipelineOutcome:
     usage: list = field(default_factory=list)
     calls: list = field(default_factory=list)
     tool_events: list = field(default_factory=list)
-    screen_findings: Optional[ScreenFindings] = None  # 看图结果（看图模型接入前始终为空）
+    screen_findings: Optional[ScreenFindings] = None  # 返回给 Server 的看图结果
+    perception: Optional[Perception] = None  # 完整的看图结果（窗口、页面、报错），后续阶段交给评估使用
 
 
 class Diagnoser:
     """一次请求：排队 → 评估（DSH + 工具，不显示）→ 校验 → 回答（DSH，逐段推送）→ 组装 DiagnoseResponse。"""
 
     def __init__(self, settings: Settings, runner: Runner, courses: CourseRepository,
-                 telemetry: Optional[Telemetry] = None):
+                 telemetry: Optional[Telemetry] = None, screen_analyzer: Optional[ScreenAnalyzer] = None):
         self.settings, self.runner, self.courses = settings, runner, courses
         self.telemetry = telemetry or Telemetry()
+        # 进程内共用一个：同一张图的结果复用、每台 VM 的看图次数限制都在这里。
+        self.screen_analyzer = screen_analyzer or ScreenAnalyzer(settings.vision())
         self.slots = asyncio.Semaphore(settings.max_concurrent_requests)
 
     async def diagnose(self, request: ScreenDiagnoseRequest,
@@ -260,8 +291,8 @@ class Diagnoser:
             result.tool_events.extend(outcome.tool_events)
             return outcome
 
-        # 0. 虚拟机画面：先检查；看图模型接入前，合格的截图也只记 SCREEN_NOT_ANALYZED。
-        screen_limitations = self._check_screen(request, stage)
+        # 0. 虚拟机画面：检查截图，再交给看图模型；失败不影响后面的诊断和回答。
+        screen_limitations = self._screen(request, stage, deadline, cancel, result)
 
         # 1. 评估：可以调工具，最后只输出评估 JSON；文字不推送给学生。
         stage("reasoning_started", {"turn": 1})
@@ -322,9 +353,9 @@ class Diagnoser:
             result.answer_error = "MODEL_STREAM_ERROR"
         return result
 
-    @staticmethod
-    def _check_screen(request: ScreenDiagnoseRequest, stage: Callable[..., None]) -> list:
-        """检查请求里的截图，返回要记进 limitations 的原因码。截图不合格不影响回答，只是不看图。"""
+    def _screen(self, request: ScreenDiagnoseRequest, stage: Callable[..., None], deadline: float,
+                cancel: threading.Event, result: PipelineOutcome) -> list:
+        """检查并看图，返回要记进 limitations 的原因码；看图结果和用量写进 result。"""
         capture = getattr(request, "screen", None)
         if capture is None:
             return []
@@ -333,9 +364,34 @@ class Diagnoser:
         except ScreenRejected as rejected:
             stage(SCREEN_ANALYZED, {"status": "rejected", "code": rejected.code})
             return [rejected.code]
-        loaded.close()
-        stage(SCREEN_ANALYZED, {"status": "skipped", "code": SCREEN_NOT_ANALYZED})
-        return [SCREEN_NOT_ANALYZED]
+        try:
+            if not self.screen_analyzer.enabled:
+                stage(SCREEN_ANALYZED, {"status": "skipped", "code": SCREEN_NOT_ANALYZED})
+                return [SCREEN_NOT_ANALYZED]
+            budget = min(self.settings.vision_timeout_seconds,
+                         deadline - time.monotonic() - TIME_AFTER_SCREEN_SECONDS)
+            if budget < MIN_SCREEN_BUDGET_SECONDS:
+                stage(SCREEN_ANALYZED, {"status": "failed", "code": SCREEN_ANALYSIS_TIMEOUT})
+                return [SCREEN_ANALYSIS_TIMEOUT]
+            stage(SCREEN_ANALYZING)
+            outcome = self.screen_analyzer.analyze(
+                loaded, question=request.question, lesson_title=request.current_step.title, lab_id=request.lab_id,
+                language=request.response_language, budget_seconds=budget, cancel=cancel)
+        except Exception:  # 看图出任何意外都不能影响诊断
+            LOG.exception("screen analysis failed for request %s", request.request_id)
+            stage(SCREEN_ANALYZED, {"status": "failed", "code": SCREEN_ANALYSIS_FAILED})
+            return [SCREEN_ANALYSIS_FAILED]
+        finally:
+            loaded.close()
+        result.calls.extend(outcome.calls)
+        result.usage.extend(outcome.usage)
+        result.screen_findings = outcome.findings
+        result.perception = outcome.perception if outcome.status == "ok" else None
+        data = {"status": outcome.status, "passes": outcome.passes, "cached": outcome.cached}
+        if outcome.code:
+            data["code"] = outcome.code
+        stage(SCREEN_ANALYZED, data)
+        return [outcome.code] if outcome.code else []
 
     async def _diagnose(self, request: ScreenDiagnoseRequest, publish: Optional[Publish],
                         trace: RequestTrace) -> ScreenDiagnoseResponse:
@@ -460,13 +516,16 @@ def _sse_event(event: str, data: dict) -> str:
 
 def create_app(*, settings: Optional[Settings] = None, runner: Optional[Runner] = None,
                course_repository: Optional[CourseRepository] = None,
-               telemetry: Optional[Telemetry] = None) -> FastAPI:
+               telemetry: Optional[Telemetry] = None, screen_analyzer: Optional[ScreenAnalyzer] = None) -> FastAPI:
     config = settings or Settings.from_env()
     courses = course_repository or CourseRepository(config.course_directory)
     selected_runner = runner or (fake_runner if config.model_provider == "fake" else run_once)
     monitor = telemetry or Telemetry.from_env(provider_name=provider_name(config.model_provider, config.model_base_url),
                                               model=config.model_name or config.model_provider)
-    diagnoser = Diagnoser(config, selected_runner, courses, monitor)
+    diagnoser = Diagnoser(config, selected_runner, courses, monitor, screen_analyzer)
+    if config.vision_model and not diagnoser.screen_analyzer.enabled:
+        LOG.warning("AIVIRTEACH_VISION_MODEL_NAME is set but the vision base URL is not a root or /v1 URL; "
+                    "screens will not be analyzed")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
