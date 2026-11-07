@@ -372,3 +372,58 @@ class SettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScreenEvalTests(unittest.TestCase):
+    """sandbox/screen_eval.py 的打分（服务器测试用它评测真实看图模型）。"""
+
+    def test_bundled_cases_are_consistent(self):
+        from pathlib import Path
+        spec = json.loads((Path(__file__).resolve().parents[1] / "screens" / "cases.json").read_text())
+        for case in spec["cases"]:
+            image = Image.open(Path(__file__).resolve().parents[1] / "screens" / case["image"])
+            self.assertEqual(image.size, (1600, 1000), case["name"])
+            self.assertTrue(case["question"] and case["expect"], case["name"])
+
+    def test_scoring(self):
+        from sandbox.screen_eval import score
+        from dsh_tutor.platform_screen import Highlight
+        from dsh_tutor.platform_vision import Perception, VisionResult
+        good = Perception(readable=True, window="browser", app="Firefox", page="n8n", summary="s",
+                          visible_errors=["service n8n refers to undefined volume ai daily briefing n8n data"],
+                          elements=[Highlight(label="Execute workflow 按钮", x=0.44, y=0.88, width=0.12, height=0.05)],
+                          zoom=None, contains_sensitive=False)
+        ok = VisionResult("ok", perception=good)
+        expect = {"window": "browser", "error_contains": "ai_daily_briefing_n8n_data", "element_contains": "execute",
+                  "target": {"x": 0.4481, "y": 0.893, "width": 0.1009, "height": 0.036}}
+        self.assertEqual(score(expect, ok), {"usable": True, "window": True, "error": True, "element": True})
+        self.assertEqual(score({**expect, "target": {"x": 0.1, "y": 0.1, "width": 0.05, "height": 0.05}}, ok)["element"],
+                         False)
+        self.assertEqual(score({"element_contains": "Execute", "region": "底部中间"}, ok)["element"], True)
+        self.assertEqual(score({"element_contains": "Execute", "region": "右上"}, ok)["element"], False)
+        failed = VisionResult("failed", vision.SCREEN_ANALYSIS_INVALID)
+        self.assertEqual(score(expect, failed), {"usable": False, "window": False, "error": False, "element": False})
+        self.assertEqual(score({"sensitive": True}, VisionResult("rejected", vision.SCREEN_SENSITIVE_CONTENT)),
+                         {"sensitive": True})
+        self.assertEqual(score({"sensitive": True}, ok), {"sensitive": False})
+
+    def test_command_line_with_a_fake_model(self):
+        import contextlib
+        from pathlib import Path
+        from sandbox import screen_eval
+        fake = FakeVision()
+        output = io.StringIO()
+        cases = Path(__file__).resolve().parents[1] / "screens" / "cases.json"
+        real_analyzer = screen_eval.ScreenAnalyzer
+        with mock.patch.object(screen_eval, "ScreenAnalyzer",
+                               lambda settings: real_analyzer(settings, transport=httpx.MockTransport(fake))), \
+                mock.patch.dict(os.environ, {"AIVIRTEACH_MODEL_API_KEY": "k"}, clear=True), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(screen_eval.main([str(cases), "--runs", "2"]), 0)
+        lines = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(fake.requests), 8)  # 4 张 × 2 次，每次都重新看（不复用结果）
+        summary = lines[-1]["summary"]
+        self.assertEqual(summary["sensitive"], "0/2")  # 假模型从不报告敏感内容
+        self.assertEqual(summary["usable"], "6/6")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(screen_eval.main([str(cases)]), 2)  # 没有密钥时直接退出

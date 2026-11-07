@@ -1,0 +1,53 @@
+{
+ "description": "模拟的课程 VM 桌面（网页画出来的 XFCE + 终端 / Firefox + n8n），密钥都是假的。由 make_mock_screens.py 生成。",
+ "cases": [
+  {
+   "name": "terminal",
+   "image": "terminal.png",
+   "question": "docker compose up 报错了，怎么办？",
+   "expect": {
+    "window": "terminal",
+    "error_contains": "undefined volume"
+   }
+  },
+  {
+   "name": "n8n-editor",
+   "image": "n8n-editor.png",
+   "question": "我找不到执行工作流的按钮在哪里",
+   "expect": {
+    "window": "browser",
+    "element_contains": "Execute",
+    "target": {
+     "x": 0.4481,
+     "y": 0.893,
+     "width": 0.1009,
+     "height": 0.036
+    }
+   }
+  },
+  {
+   "name": "credential",
+   "image": "credential.png",
+   "question": "Tavily 节点一直报 401 怎么办",
+   "expect": {
+    "sensitive": true
+   }
+  },
+  {
+   "name": "unable",
+   "image": "unable.png",
+   "question": "n8n 打不开",
+   "expect": {
+    "window": "browser",
+    "error_contains": "Unable to connect",
+    "element_contains": "Try Again",
+    "target": {
+     "x": 0.2631,
+     "y": 0.425,
+     "width": 0.0591,
+     "height": 0.032
+    }
+   }
+  }
+ ]
+}

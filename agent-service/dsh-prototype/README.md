@@ -84,6 +84,7 @@ python3 -m venv .venv
 - `sandbox/tests/test_deploy_config.py`：部署文件的安全设置；`promtool`、`amtool`、`otelcol-contrib` 在 PATH 时还检查告警规则（含 `deploy/alerts.test.yml`）和配置。
 - `sandbox/tests/test_telemetry.py`：监控 span 的结构、属性、token 换算、失败标记和隐私默认值（内存导出，不需要 Phoenix）。
 - `sandbox/tests/test_screen.py`：虚拟机画面的请求和返回格式、图片检查（每种不合格情况的原因码、特制的大尺寸文件头）、缩略和裁剪、没有截图时返回与 main 相同、422 不回显截图、请求体上限。
+- `sandbox/screen_eval.py`：用真实看图模型评测截图（服务器测试 T11 使用）：`python -m sandbox.screen_eval sandbox/screens/cases.json --runs 3`。`sandbox/screens/` 是 4 张模拟的课程桌面截图（假密钥）和期望值，`make_mock_screens.py` 可以重新生成（需要 Playwright）。
 - `sandbox/tests/test_screen_flow.py`：问题分类、提示词里的画面描述、界面类问题的调用上限、画面引用不影响 main 的校验、收尾阶段、回答末尾的说明和 `screen_requested` 事件、开关关闭且不带画面时与 main 相同。
 - `sandbox/tests/test_vision.py`：看图的请求格式、整屏 → 放大两次看图和坐标换算、密钥过滤、输出格式错误、HTTP 错误和重试、超时和取消、结果复用、每台 VM 的次数限制、接入请求流程、用量合并、监控里不含图片和看图原文（看图模型用 httpx 的模拟传输，不连真实模型）。
 
