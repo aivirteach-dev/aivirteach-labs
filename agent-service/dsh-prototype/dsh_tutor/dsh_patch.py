@@ -63,12 +63,19 @@ def provider_plugin(provider: Provider, *, model: str, context_window: int, max_
         "retryPolicy": {"mode": "normal", "maxRetries": 0}, "models": [entry]}}}}
 
 
+# 单次模型调用多久还没输出任何内容就放弃并重试一次（服务器测试里出现过一次调用卡住、用光 40 秒总时限）。
+# 实测正常请求的首字在 1～4 秒；评估阶段的提示词最长约 2 万 token，留足余量。
+FIRST_TOKEN_SECONDS = 15
+
+
 def budget_plugin(*, provider_id: str, model: str, max_model_calls: int, max_output_tokens: int,
-                  max_output_bytes: int, deadline_unix: float, allowed_tools: list, run_dir: Path) -> dict:
+                  max_output_bytes: int, deadline_unix: float, allowed_tools: list, run_dir: Path,
+                  first_token_seconds: int = FIRST_TOKEN_SECONDS) -> dict:
     """预算插件只读这里给的值；模型不能改变路径、工具集或上限。"""
     return {"id": "tutor-model-budget", "name": str(BUDGET_PLUGIN), "config": {
         "provider": provider_id, "model": model, "maxModelCalls": max_model_calls, "maxTokens": max_output_tokens,
         "maxOutputBytes": max_output_bytes, "deadlineUnix": deadline_unix, "allowedTools": allowed_tools,
+        "firstTokenMs": int(first_token_seconds * 1000),
         "cancelPath": str(run_dir / "cancel.request"), "budgetPath": str(run_dir / "budget.json"),
         "streamPath": str(run_dir / "stream.jsonl")}}
 

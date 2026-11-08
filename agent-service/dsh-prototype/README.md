@@ -10,14 +10,14 @@
 
 与 main 逐字对应、由测试自动对比的部分：请求/返回格式（`platform_models.py`）、20 个只读工具的参数和授权校验（`platform_tools.py`）、脱敏（`platform_security.py`）、课程资料补充（`platform_course.py`）。SSE 事件名和帧格式、Gateway 错误码、证据编号（`obs-001`…）、工具调用次数上限也与 main 一致。
 
-### 扩展：虚拟机画面（开发中，已完成阶段 1～3）
+### 扩展：虚拟机画面（开发中）
 
 学生同意后，Client 可以把 Guacamole 当前显示的 VM 桌面截图放进请求，Agent 据此判断学生停在哪个窗口、找不到哪个按钮。代码在 `platform_screen.py`，`platform_models.py` 仍是 main 的原样副本。
 
 - 请求可选字段 `screen`：`source`（固定 `vm_console`）、`mime_type`（`image/png`、`image/jpeg`、`image/webp`）、`data`（标准 base64，不带 `data:` 前缀）、`width`、`height`、`captured_at`。
 - 返回可选字段 `screen_findings`：`summary` 和最多 5 个 `highlights`（按比例的坐标 `x`、`y`、`width`、`height`，0～1）。没有结果时返回里不出现这个字段。
-- 新增 SSE 事件 `screen_analyzing`、`screen_analyzed`（`status` 为 `ok` / `skipped` / `rejected` / `failed`，带原因码）、`screen_requested`。现在的 Client 不认识这些事件，会直接忽略。
-- 兼容性：Server 不发 `screen` 时，请求处理、返回内容和事件与 main 完全相同。Server 用 zod 校验返回，不认识的字段会被去掉，不会出错。
+- 不新增 SSE 事件：带不带截图，进度事件都与 main 相同。截图没用上的原因只写进 `limitations`，回答末尾有一句说明；Client 自己知道带了截图，可以自己显示“正在查看画面”。
+- 兼容性：Server 不发 `screen` 时，请求处理、返回内容和事件与 main 完全相同；发了 `screen` 时，模型调用次数和事件也不变，只是评估多了画面描述、返回多了 `screen_findings`。Server 用 zod 校验返回，不认识的字段会被去掉，不会出错。
 - 检查：先按文件头判断格式和尺寸，再完整解码。解码后最大 3 MB、单边最大 2560、总像素最多 2560×1600、不接受动图、声明的宽高必须与实际一致。不合格时不影响回答，只在 `limitations` 里记原因码（`SCREEN_INVALID_BASE64`、`SCREEN_TOO_LARGE`、`SCREEN_FORMAT_MISMATCH`、`SCREEN_DIMENSIONS_TOO_LARGE`、`SCREEN_DIMENSIONS_MISMATCH`、`SCREEN_ANIMATED`、`SCREEN_UNREADABLE`）。
 - 隐私：截图只在内存里处理，不写文件、日志和监控，也不进任何提示词；`screen` 下的 422 错误不回显输入；超过 6 MB 的请求体在解析前返回 413。
 - 看图（`platform_vision.py`）：在评估之前，把截图交给单独配置的看图模型（OpenAI 兼容的 `/chat/completions`，不经过 DSH），得到固定格式的界面描述：窗口类型、程序、页面、一两句描述、可见的报错、最多 5 个相关元素的位置，以及是否含密钥等敏感内容。
@@ -29,11 +29,9 @@
   - 看图的 token 并入返回的 `usage`，Server 现有计费会算上；监控里是单独的 `chat <看图模型>` span（`aivirteach.phase` 为 `screen`），只有耗时和 token，没有图片和看图原文。
   - 结果放进返回的 `screen_findings`（描述和标注位置）。
 - 接入诊断（`platform_screen_flow.py`）：
-  - 问题按关键词分为界面类（按钮、菜单、点了没反应、只说“找不到 / 在哪”且没有环境类的词）、环境类（容器、端口、命令、连接）和其他，不额外调用模型。
   - 有画面时，画面描述（窗口、页面、报错、相关元素的粗略位置如“右上”“底部中间”，不含坐标和图片）加进评估和收尾的用户消息，系统消息多一段使用规则；回答阶段仍只看校验过的评估（与 main 相同）。画面描述没有观察编号，评估 JSON 里引用了也会在 main 的校验之前去掉。
-  - 界面类问题评估阶段最多 2 次模型调用（画面或课程步骤已经说明学生在哪一步）。
   - 回答末尾的说明：带了画面但没用上时说明原因（含密钥、次数用完、其他原因），说明也逐段推送。
-  - `AIVIRTEACH_SCREEN_REQUESTS=true` 时，界面类问题没有画面也按上面的方式减少调用，回答末尾提示学生发送画面，回答结束后发 `screen_requested` 事件。Client 支持截图之前保持关闭；关闭且不带画面时，处理、返回和事件与 main 完全相同。
+  - 2026-11-08 简化：删掉了按关键词的问题分类、“界面类问题评估最多 2 次”、`AIVIRTEACH_SCREEN_REQUESTS` 提示开关和 3 个看图进度事件（见 `docs/removed-features.md`）。
 - 实测（DeepSeek 对话 + 看图、真实 DSH、假 Gateway、仓库教材、模拟截图）：界面问题带画面约 11 秒，回答直接指出“画布底部中间的橙色 Execute workflow 按钮”，标注位置落在按钮上；环境问题带画面约 12.5 秒，结合画面上的 Unable to connect 和教材里的目录、容器名、就绪检查给出步骤。评测（阶段 4）尚未做。
 
 ## 一次请求怎么跑
@@ -41,12 +39,12 @@
 1. `platform_app.py`：鉴权、排队（并发上限），在工作线程里按 main 的流程依次运行各阶段，把过程事件转成 SSE：
    - **评估**：DSH + 工具，模型查证后只输出结构化评估 JSON（诊断、课程对应、证据编号、建议、限制），不推送给学生；
    - **收尾**：只在检查次数用完、还没给出评估时，不带工具再问一次；
-   - **校验**：JSON 结构和证据编号不合规就不写回答（`ASSESSMENT_INVALID`）；
+   - **校验**：JSON 结构和证据编号不合规就不写回答（`ASSESSMENT_INVALID`）。比 main 多两步容错（实测 DeepSeek 约 5～8% 的评估有这类问题）：校验前先去掉规定以外的字段（模型偶尔多写 `course_alignment_note: ""` 这类空字段，main 会因此作废整个评估）；JSON 括号不配对、不完整时，剩余时间够 15 秒就不带工具按已有证据再要一次评估（发 main 已有的 `finalization_started` 事件，`reason` 为 `assessment_unstructured`）。规定字段的类型、长度和证据编号仍按 main 的规则严格校验；
    - **回答**：另起一个不带工具的 DSH 会话，只根据校验过的评估写回答，逐段推送。
    提示词和校验在 `platform_assessment.py`（解析和兜底照抄 main，测试对比两边结果）；每个阶段的规则作为系统消息（经 DSH 的 `DSH_SYSTEM_PROMPT`），数据作为用户消息。
 2. `platform_runtime.py`：运行一个阶段：建临时运行目录，启动一个 DSH 会话，读取事件文件，结束后删除目录。
 3. `dsh_patch.py`：生成本次请求的 DSH 补丁——模型提供方、预算插件、工具桥。DSH 自带的文件、Shell、摘要、重试等插件在 `dsh-base.patch.yml` 里关闭。
-4. `plugins/model_budget.mjs`（预算插件）：每次模型调用前检查次数、单次输出上限、工具集、总时限、取消；把文字片段、用量、结束原因写进事件文件。连接被切断或请求超时、且模型还没输出任何内容时，同一次调用重试一次（不会出现重复内容，也不算新的模型调用）。
+4. `plugins/model_budget.mjs`（预算插件）：每次模型调用前检查次数、单次输出上限、工具集、总时限、取消；把文字片段、用量、结束原因写进事件文件。连接被切断、请求超时，或 15 秒内一个字都没输出（首字超时），且模型还没输出任何内容时，同一次调用重试一次（不会出现重复内容，也不算新的模型调用）。重试后仍失败的调用报告为 `MODEL_PROVIDER_ERROR`（已输出一部分时为 `MODEL_STREAM_INCOMPLETE`），不会把半截输出当成模型的正常回答。
 5. `platform_mcp.py`（工具桥，MCP stdio）：按 Server 给的 `diagnostic_scope` 校验后调用 Gateway `POST /v1/diagnostics/{lab_id}/tools/{tool}`，写证据和调用记录。Server 不传范围时，与 main 一样只有 `get_vm_status`、`get_guest_agent_status`。
 
 事件文件每行带毫秒时间戳 `t`；`RunOutcome.calls` 给出每次模型调用的开始、首字、结束时间、结束原因和用量，监控据此按 OpenTelemetry 发送到 Phoenix，见 [docs/monitoring.md](docs/monitoring.md)。DSH 官方遥测会把会话发往 DeepSeek，已用 `DSH_TELEMETRY_DISABLED=1` 关闭。
@@ -63,9 +61,9 @@
 
 沿用 main 的变量：`AIVIRTEACH_AGENT_TOKEN`、`AIVIRTEACH_AGENT_HOST`/`PORT`、`AIVIRTEACH_AGENT_CORS_ORIGINS`、`AIVIRTEACH_COURSE_DIR`、`AIVIRTEACH_GATEWAY_URL`、`AIVIRTEACH_DIAGNOSTIC_TOKEN`、`AIVIRTEACH_MODEL_PROVIDER`（`fake`、`ollama`、`openai_compatible`，默认 `fake`）、`AIVIRTEACH_MODEL_BASE_URL`（根地址如 `https://api.deepseek.com/` 会自动补 `/v1`）、`AIVIRTEACH_MODEL_API_KEY`、`AIVIRTEACH_MODEL_NAME`、`AIVIRTEACH_MODEL_THINKING`（只有 `enabled` 才开启思考）、`AIVIRTEACH_AGENT_TOTAL_TIMEOUT`（默认 40 秒，排队时间也计入）、`AIVIRTEACH_TOOL_TIMEOUT`（8）、`AIVIRTEACH_MAX_REASONING_TURNS`（4）、`AIVIRTEACH_MAX_TOOL_CALLS`（6，含被拒绝的调用）、`AIVIRTEACH_MAX_TOOL_OUTPUT_CHARS`（32768）、`AIVIRTEACH_MAX_CONCURRENT_REQUESTS`（4）。`AIVIRTEACH_MODEL_TIMEOUT` 不使用：DSH 由总超时和预算插件约束。
 
-看图（可选，不设模型名就不看图）：`AIVIRTEACH_VISION_MODEL_NAME`（例如 DeepSeek 的 `deepseek-flash`）、`AIVIRTEACH_VISION_MODEL_BASE_URL`（默认沿用 `AIVIRTEACH_MODEL_BASE_URL`）、`AIVIRTEACH_VISION_MODEL_API_KEY`（默认沿用 `AIVIRTEACH_MODEL_API_KEY`；本地 Ollama 等不需要密钥的可以都不设）、`AIVIRTEACH_VISION_TIMEOUT`（默认 12 秒，范围 3～30）、`AIVIRTEACH_SCREEN_MAX_PER_HOUR`（每台 VM 每小时最多看图次数，默认 10，0 表示不限）、`AIVIRTEACH_SCREEN_REQUESTS`（`true` 时界面类问题没有画面也提示学生发送，默认关闭）。地址不是根地址或 `/v1` 结尾时不看图，并在启动日志里提示。
+看图（可选，不设模型名就不看图）：`AIVIRTEACH_VISION_MODEL_NAME`（例如 DeepSeek 的 `deepseek-flash`）、`AIVIRTEACH_VISION_MODEL_BASE_URL`（默认沿用 `AIVIRTEACH_MODEL_BASE_URL`）、`AIVIRTEACH_VISION_MODEL_API_KEY`（默认沿用 `AIVIRTEACH_MODEL_API_KEY`；本地 Ollama 等不需要密钥的可以都不设）、`AIVIRTEACH_VISION_TIMEOUT`（默认 12 秒，范围 3～30）、`AIVIRTEACH_SCREEN_MAX_PER_HOUR`（每台 VM 每小时最多看图次数，默认 10，0 表示不限）。地址不是根地址或 `/v1` 结尾时不看图，并在启动日志里提示。
 
-DSH 专用：`AIVIRTEACH_DSH_CONTEXT_WINDOW`（32768）、`AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS`（4096）、`AIVIRTEACH_DSH_STATE_DIR`（每次请求的临时目录，结束即删）。关闭思考时固定发送 `reasoning_effort: none`（DeepSeek、Ollama 实测都接受）；运行账号由镜像的 `USER 1000`（`dsh-runner`）和 compose 的 `user` 保证。
+DSH 专用：`AIVIRTEACH_DSH_CONTEXT_WINDOW`（32768）、`AIVIRTEACH_DSH_MAX_OUTPUT_TOKENS`（4096）、`AIVIRTEACH_DSH_STATE_DIR`（每次请求的临时目录，结束即删；启动时删除上次进程被杀时留下的目录）。关闭思考时固定发送 `reasoning_effort: none`（DeepSeek、Ollama 实测都接受）；运行账号由镜像的 `USER 1000`（`dsh-runner`）和 compose 的 `user` 保证。
 
 ## 开发和测试
 
@@ -85,7 +83,9 @@ python3 -m venv .venv
 - `sandbox/tests/test_telemetry.py`：监控 span 的结构、属性、token 换算、失败标记和隐私默认值（内存导出，不需要 Phoenix）。
 - `sandbox/tests/test_screen.py`：虚拟机画面的请求和返回格式、图片检查（每种不合格情况的原因码、特制的大尺寸文件头）、缩略和裁剪、没有截图时返回与 main 相同、422 不回显截图、请求体上限。
 - `sandbox/screen_eval.py`：用真实看图模型评测截图（服务器测试 T11 使用）：`python -m sandbox.screen_eval sandbox/screens/cases.json --runs 3`。`sandbox/screens/` 是 4 张模拟的课程桌面截图（假密钥）和期望值，`make_mock_screens.py` 可以重新生成（需要 Playwright）。
-- `sandbox/tests/test_screen_flow.py`：问题分类、提示词里的画面描述、界面类问题的调用上限、画面引用不影响 main 的校验、收尾阶段、回答末尾的说明和 `screen_requested` 事件、开关关闭且不带画面时与 main 相同。
+- `sandbox/tests/test_screen_flow.py`：提示词里的画面描述、带截图时预算和事件与不带时相同、画面引用不影响 main 的校验、收尾阶段、回答末尾的说明。
+- `sandbox/tests/test_diagnostics.py`：评估没通过校验时记录是哪一类问题（不含原文）、慢请求和失败请求的调用摘要日志、监控只记原因码、提示词里稳定的部分在前（利于缓存）、启动时清理遗留目录。
+- `sandbox/pipeline_eval.py`：用真实模型把整条诊断流程重复跑多次（假 Gateway、模拟截图），统计完成率、耗时、token、缓存命中率和失败类别：`python -m sandbox.pipeline_eval --runs 5`。
 - `sandbox/tests/test_vision.py`：看图的请求格式、整屏 → 放大两次看图和坐标换算、密钥过滤、输出格式错误、HTTP 错误和重试、超时和取消、结果复用、每台 VM 的次数限制、接入请求流程、用量合并、监控里不含图片和看图原文（看图模型用 httpx 的模拟传输，不连真实模型）。
 
 ## 实测（本地，假 Gateway）
@@ -93,6 +93,8 @@ python3 -m venv .venv
 - DeepSeek `deepseek-v4-flash`：按授权依次调用容器、端口、日志工具并引用证据回答；`usage` 与提供方一致。
 - Ollama `qwen3.5:9b`：工具调用和证据正常，`usage` 为 null（不按缓存计量，与 main 一致）。
 - 每个并发请求 1 个 DSH 运行时进程，约 11 个线程、190MB 独占内存；首字 0.35～3 秒。调用方断开或总超时后通知 DSH 停止，实测 0.3 秒内退出。
+- 固定开销（假模型、立即回答）：每个 DSH 阶段启动约 0.5 秒、退出约 0.3 秒；带工具时连接 MCP 工具桥再多约 1 秒。一个带工具的请求约 2.9 秒后才出第一个字，与模型无关。
+- 2026-11-09 整条流程重复评测（`sandbox/pipeline_eval.py`，DeepSeek `deepseek-v4-flash` + 看图 `deepseek-flash`、假 Gateway、模拟截图，4 种请求各 10 次）：40/40 completed；3 次评估 JSON 不完整，都由再要一次评估救回（每次多约 4.5 秒）。平均总耗时 / 首字：带工具范围 12.6 / 10.8 秒，界面问题带截图 14.6 / 13.2 秒，环境问题带截图 15.6 / 13.9 秒，坏截图 10.2 / 8.7 秒；平均 token 1.0 万～1.9 万，其中输入缓存命中约 80%，输出约 1,000～1,500。
 
 ## 当前边界
 

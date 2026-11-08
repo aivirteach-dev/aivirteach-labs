@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
 LOG = logging.getLogger("aivirteach.dsh_agent.telemetry")
+# limitations 里除了原因码（如 SCREEN_UNREADABLE），还有模型在评估里写的说明句子；监控只记原因码。
+CODE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{2,63}")
 SERVICE_NAME = "aivirteach-dsh-agent"
 PROJECT_NAME = "aivirteach-agent"  # Phoenix 里的项目名，可用 OTEL_RESOURCE_ATTRIBUTES=openinference.project.name=... 覆盖
 AGENT_NAME = "aivirteach-tutor"
@@ -138,7 +141,8 @@ class Telemetry:
 
         calls = list(getattr(outcome, "calls", []) or [])
         tools = [e for e in (getattr(outcome, "tool_events", []) or []) if e.get("name") == "tool_finished"]
-        limitations = list(response.limitations) if response is not None else []
+        limitations = [code for code in (response.limitations if response is not None else [])
+                       if CODE_PATTERN.fullmatch(str(code))]
         failure = next((code for code in limitations if code in FAILURE_CODES), None)
         if response is None:
             failure = "CLIENT_DISCONNECTED"
@@ -165,6 +169,10 @@ class Telemetry:
             "aivirteach.tool_calls": len(tools),
             "aivirteach.response_ms": (response_ns - trace.started_ns) // 1_000_000,
         }
+        if getattr(outcome, "assessment_error", ""):
+            attributes["aivirteach.assessment_error"] = outcome.assessment_error
+        if getattr(outcome, "dropped_fields", None):
+            attributes["aivirteach.assessment_dropped_fields"] = list(outcome.dropped_fields)
         if trace.queue_wait_ms is not None:
             attributes["aivirteach.queue_wait_ms"] = trace.queue_wait_ms
         if first_delta is not None:

@@ -66,6 +66,21 @@ class MonitoringComposeTests(unittest.TestCase):
         self.assertIn('OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"', platform)
         self.assertIn('AIVIRTEACH_OTEL_CAPTURE_CONTENT: "${AIVIRTEACH_OTEL_CAPTURE_CONTENT:-false}"', platform)
 
+    def test_platform_compose_forwards_every_setting_the_agent_reads(self):
+        """服务器测试发现看图变量没有传进容器：Agent 读取的每个环境变量，compose 都要原样转发。"""
+        platform = (ROOT / "compose.platform.yaml").read_text(encoding="utf-8")
+        forwarded = set(re.findall(r"^\s+([A-Z][A-Z0-9_]+): ", platform, re.M))
+        read = set()
+        for source in (ROOT / "dsh_tutor").glob("*.py"):
+            text = source.read_text(encoding="utf-8")
+            read |= set(re.findall(r'(?:getenv|_int_env)\(\s*"((?:AIVIRTEACH|OTEL)_[A-Z0-9_]+)"', text))
+            read |= set(re.findall(r'^[A-Z_]+_ENV = "((?:AIVIRTEACH)_[A-Z0-9_]+)"', text, re.M))
+        # 只在宿主机启动脚本或进程内部用到、容器里由 compose 固定的变量
+        not_needed = {"AIVIRTEACH_AGENT_ENV_FILE", "AIVIRTEACH_DSH_STATE_DIR", "OTEL_SDK_DISABLED",
+                      "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"}
+        self.assertTrue(read, "no settings found")
+        self.assertEqual(sorted(read - forwarded - not_needed), [])
+
     def test_secret_files_are_ignored_by_git(self):
         ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").split()
         self.assertIn(".env.*", ignored)

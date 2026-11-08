@@ -8,6 +8,7 @@ prompt_tokens_details.cached_tokens。
   {"text": ["片段", ...], "finish": "stop"}            输出文字（finish 可为 "length"）
   {"tool": "get_vm_status", "arguments": {...}}        调用一个平台工具
   {"slow": 秒数}                                       每 50ms 输出一个片段，用于测试取消和超时
+  {"stall": 秒数, "text": [...]}                       先停这么久不输出任何内容，再输出文字（测试首字超时）
 脚本用完后统一回答 "done"。
 """
 from __future__ import annotations
@@ -61,6 +62,11 @@ def create_app(script: list) -> FastAPI:
                         "function": {"name": name, "arguments": json.dumps(step.get("arguments", {}))}}
                 yield _chunk(model, {"tool_calls": [call]})
                 finish = "tool_calls"
+            elif "stall" in step:
+                await asyncio.sleep(step["stall"])
+                for piece in step.get("text", ["迟到的回答"]):
+                    yield _chunk(model, {"content": piece})
+                finish = "stop"
             elif "slow" in step:
                 end = time.monotonic() + step["slow"]
                 while time.monotonic() < end:

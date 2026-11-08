@@ -35,12 +35,8 @@ MIN_CROP_SIDE = 32
 # 普通请求只有几十 KB；带截图时 base64 约 4 MB。超过这个大小的请求体在解析前就拒绝。
 MAX_REQUEST_BODY_BYTES = 6 * 1024 * 1024
 
-# 进度事件（SSE）。现在的 Client 不认识这些事件名，会直接忽略。
-SCREEN_ANALYZING = "screen_analyzing"        # 开始看图
-SCREEN_ANALYZED = "screen_analyzed"          # 看图结束：status = ok / skipped / rejected / failed
-SCREEN_REQUESTED = "screen_requested"        # 建议学生提供画面（阶段 3 使用）
-
-# 原因码（写进 limitations，也放在 screen_analyzed 事件里）。
+# 没有新增进度事件：带不带截图，SSE 事件都与 main 相同。截图没用上的原因只写进 limitations。
+# 原因码：
 SCREEN_INVALID_BASE64 = "SCREEN_INVALID_BASE64"
 SCREEN_TOO_LARGE = "SCREEN_TOO_LARGE"
 SCREEN_FORMAT_MISMATCH = "SCREEN_FORMAT_MISMATCH"

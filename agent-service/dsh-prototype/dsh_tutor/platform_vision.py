@@ -25,7 +25,7 @@ from .platform_runtime import ModelCall
 from .platform_screen import Highlight, LoadedScreen, ScreenFindings, png_data_url
 from .platform_security import redact_text
 
-# 原因码（写进 limitations，也放在 screen_analyzed 事件里）。
+# 原因码（写进 limitations）。
 SCREEN_ANALYSIS_TIMEOUT = "SCREEN_ANALYSIS_TIMEOUT"      # 看图超时，或剩余时间不够看图
 SCREEN_ANALYSIS_FAILED = "SCREEN_ANALYSIS_FAILED"        # 看图模型连不上、报错或拒绝了图片
 SCREEN_ANALYSIS_INVALID = "SCREEN_ANALYSIS_INVALID"      # 看图模型的输出不是规定的 JSON

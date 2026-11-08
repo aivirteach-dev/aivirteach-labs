@@ -14,7 +14,6 @@ import httpx
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from dsh_tutor import platform_screen as screen
 from dsh_tutor import platform_vision as vision
 from dsh_tutor.platform_app import Settings, create_app
 from dsh_tutor.platform_screen import load_screen
@@ -279,14 +278,13 @@ class PipelineTests(unittest.TestCase):
         return sse(client.post("/v1/agent/diagnose/stream", json=payload, headers=headers()).text)
 
     def test_screen_is_analyzed_before_assessment(self):
-        fake = FakeVision()
-        frames = self.stream(self.app(fake), body(screen=capture().model_dump(mode="json")))
-        names = [e for e, _ in frames]
-        self.assertLess(names.index(screen.SCREEN_ANALYZING), names.index(screen.SCREEN_ANALYZED))
-        self.assertLess(names.index(screen.SCREEN_ANALYZED), names.index("reasoning_started"))
-        event = next(d for e, d in frames if e == screen.SCREEN_ANALYZED)
-        self.assertEqual((event["status"], event["passes"], event["cached"]), ("ok", 1, False))
-        self.assertNotIn("code", event)
+        fake, calls = FakeVision(), []
+        frames = self.stream(self.app(fake, runner=answering("好", calls=calls)),
+                             body(screen=capture().model_dump(mode="json")))
+        plain = self.stream(self.app(FakeVision()), body())
+        self.assertEqual([e for e, _ in frames], [e for e, _ in plain])  # 带截图不多发任何进度事件
+        self.assertEqual(len(fake.requests), 1)
+        self.assertIn("screen_observation", calls[0][2])  # 看图在评估之前完成，结果进了评估提示词
         result = frames[-2][1]["response"]
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["screen_findings"]["highlights"][0]["label"], "Create Workflow")
@@ -298,8 +296,6 @@ class PipelineTests(unittest.TestCase):
     def test_vision_failure_does_not_block_the_answer(self):
         fake = FakeVision(httpx.Response(400))
         frames = self.stream(self.app(fake), body(screen=capture().model_dump(mode="json")))
-        event = next(d for e, d in frames if e == screen.SCREEN_ANALYZED)
-        self.assertEqual((event["status"], event["code"]), ("failed", vision.SCREEN_ANALYSIS_FAILED))
         result = frames[-2][1]["response"]
         self.assertEqual(result["status"], "completed")
         self.assertTrue(result["answer"].startswith("好\n\n（这次没能查看"))  # 告诉学生画面没用上
@@ -310,8 +306,7 @@ class PipelineTests(unittest.TestCase):
     def test_not_enough_time_skips_the_vision_call(self):
         fake = FakeVision()
         frames = self.stream(self.app(fake, total_timeout_seconds=20), body(screen=capture().model_dump(mode="json")))
-        event = next(d for e, d in frames if e == screen.SCREEN_ANALYZED)
-        self.assertEqual((event["status"], event["code"]), ("failed", vision.SCREEN_ANALYSIS_TIMEOUT))
+        self.assertIn(vision.SCREEN_ANALYSIS_TIMEOUT, frames[-2][1]["response"]["limitations"])
         self.assertEqual(fake.requests, [])
 
     def test_vision_call_is_its_own_span_without_content(self):
@@ -335,8 +330,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_without_screen_no_vision_call(self):
         fake = FakeVision()
-        frames = self.stream(self.app(fake), body())
-        self.assertFalse({e for e, _ in frames} & {screen.SCREEN_ANALYZING, screen.SCREEN_ANALYZED})
+        self.stream(self.app(fake), body())
         self.assertEqual(fake.requests, [])
 
 

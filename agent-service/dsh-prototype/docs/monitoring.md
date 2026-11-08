@@ -8,7 +8,7 @@ Agent 按 OpenTelemetry 标准发送监控数据（`dsh_tutor/telemetry.py`）�
 
 | span | 类型 | 内容 |
 |---|---|---|
-| `invoke_agent aivirteach-tutor` | AGENT | 整个请求：request_id、lab_id、课程和课时、是否流式、返回状态、限制码、模型调用次数、工具调用次数、排队时间、首字延迟、总耗时 |
+| `invoke_agent aivirteach-tutor` | AGENT | 整个请求：request_id、lab_id、课程和课时、是否流式、返回状态、限制码（只记原因码，不记模型写的说明句子）、评估没通过校验时的类别（`aivirteach.assessment_error`，如 `schema:diagnosis.confidence:enum`，不含原文）、模型调用次数、工具调用次数、排队时间、首字延迟、总耗时 |
 | `chat <模型>` | LLM | 每次模型调用：所属阶段（`aivirteach.phase`：screen（看图，span 名用看图模型的名字）/ assessment / finalization / answer）、连接类错误后的重试次数（`aivirteach.retries`）、耗时、首字延迟、输入/输出/缓存命中 token、结束原因、失败原因（含提供方返回的 error / aborted） |
 | `execute_tool <工具>` | TOOL | 每次工具调用：耗时、结果状态（ok/cached/denied/error）、错误码、证据编号 |
 
@@ -18,6 +18,7 @@ Agent 按 OpenTelemetry 标准发送监控数据（`dsh_tutor/telemetry.py`）�
 - **默认不记录学生问题、回答原文和工具返回内容。** `AIVIRTEACH_OTEL_CAPTURE_CONTENT=true` 时记录问题和回答，只建议在测试环境打开。
 - 不记录任何密钥和令牌。
 - 监控出错（Phoenix 没开、网络不通）只写一条警告日志，不影响请求。
+- 不开监控时也有线索：超过 25 秒、失败或被取消的请求，在 Agent 日志里写一行各次调用的摘要（阶段、耗时、首字、结束原因、工具次数、原因码、评估失败类别），不含任何原文。
 
 ## 配置
 

@@ -18,7 +18,6 @@ from test_platform_api import CLIENT_EVENTS, answering, body, client, headers, s
 
 MAIN_RESPONSE_KEYS = ["request_id", "status", "answer", "diagnosis", "course_alignment", "evidence",
                       "suggested_actions", "limitations", "tool_trace", "usage"]
-SCREEN_EVENTS = {screen.SCREEN_ANALYZING, screen.SCREEN_ANALYZED, screen.SCREEN_REQUESTED}
 
 
 def image_bytes(width=1280, height=800, fmt="PNG", **save):
@@ -134,17 +133,17 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(list(data), MAIN_RESPONSE_KEYS)
         self.assertFalse(any(code.startswith("SCREEN_") for code in data["limitations"]))
         names = [e for e, _ in sse(client().post("/v1/agent/diagnose/stream", json=body(), headers=headers()).text)]
-        self.assertFalse(set(names) & SCREEN_EVENTS)
+        self.assertTrue(set(names) <= CLIENT_EVENTS)
 
     def test_valid_screen_is_checked_but_not_analyzed_yet(self):
         calls = []
         frames = sse(client(answering("好", calls=calls)).post("/v1/agent/diagnose/stream", json=self.with_screen(),
                                                                 headers=headers()).text)
         names = [e for e, _ in frames]
-        self.assertLess(names.index(screen.SCREEN_ANALYZED), names.index("reasoning_started"))
-        event = next(d for e, d in frames if e == screen.SCREEN_ANALYZED)
-        self.assertEqual((event["status"], event["code"]), ("skipped", screen.SCREEN_NOT_ANALYZED))
-        self.assertTrue(set(names) - SCREEN_EVENTS <= CLIENT_EVENTS)
+        plain = [e for e, _ in sse(client(answering("好")).post("/v1/agent/diagnose/stream", json=body(),
+                                                                headers=headers()).text)]
+        # 带截图不多发任何进度事件（回答末尾的说明会多一段 assistant_delta）
+        self.assertEqual([e for e in names if e != "assistant_delta"], [e for e in plain if e != "assistant_delta"])
         result = frames[-2][1]["response"]
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["answer"], "好\n\n（这次没能查看你发来的虚拟机画面，以上回答没有参考画面。）")
@@ -156,8 +155,6 @@ class ApiTests(unittest.TestCase):
     def test_invalid_screen_does_not_block_the_answer(self):
         item = capture(image_bytes(1280, 800), width=1280, height=720)
         frames = sse(client().post("/v1/agent/diagnose/stream", json=self.with_screen(item), headers=headers()).text)
-        event = next(d for e, d in frames if e == screen.SCREEN_ANALYZED)
-        self.assertEqual((event["status"], event["code"]), ("rejected", screen.SCREEN_DIMENSIONS_MISMATCH))
         result = frames[-2][1]["response"]
         self.assertEqual(result["status"], "completed")
         self.assertIn(screen.SCREEN_DIMENSIONS_MISMATCH, result["limitations"])

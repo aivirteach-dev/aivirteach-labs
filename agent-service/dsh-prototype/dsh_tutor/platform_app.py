@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -30,18 +31,17 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .platform_course import CourseRepository
 from .platform_mcp import ToolContext
 from .platform_assessment import (MAX_ANSWER_CHARS, answer_prompt, assessment_fallback, assessment_prompt,
-                                  finalization_prompt, is_answer_stage, validate)
+                                  drop_unknown_fields, explain_invalid, finalization_prompt, is_answer_stage,
+                                  validate)
 from .platform_models import (CourseAlignment, DiagnoseRequest, Diagnosis, DiagnosticAssessment,
                               Evidence, ToolTrace, Usage)
 from .platform_runtime import DshSettings, RunOutcome, run_once
-from .platform_screen import (SCREEN_ANALYZED, SCREEN_ANALYZING, SCREEN_NOT_ANALYZED, SCREEN_REQUESTED, BodySizeLimit,
-                              ScreenDiagnoseRequest, ScreenDiagnoseResponse, ScreenFindings, ScreenRejected,
+from .platform_screen import (SCREEN_NOT_ANALYZED, BodySizeLimit, ScreenDiagnoseRequest, ScreenDiagnoseResponse, ScreenFindings, ScreenRejected,
                               load_screen, validation_error_handler)
-from .platform_screen_flow import (UI, UI_ASSESSMENT_MODEL_CALLS, answer_note, classify_question,
-                                   drop_screen_reference, with_screen)
+from .platform_screen_flow import answer_note, drop_screen_reference, with_screen
 from .platform_vision import (SCREEN_ANALYSIS_FAILED, SCREEN_ANALYSIS_TIMEOUT, Perception, ScreenAnalyzer,
                               VisionSettings)
-from .telemetry import RequestTrace, Telemetry, provider_name
+from .telemetry import CODE_PATTERN, RequestTrace, Telemetry, provider_name
 
 LOG = logging.getLogger("aivirteach.dsh_agent")
 SSE_HEARTBEAT_SECONDS = 10
@@ -102,8 +102,6 @@ class Settings:
     vision_api_key_env: Optional[str] = None
     vision_timeout_seconds: int = 12
     screen_max_per_hour: int = 10
-    # 界面类问题没有画面时，回答末尾提示学生发送画面。Client 支持截图之前保持关闭。
-    screen_requests: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -136,7 +134,6 @@ class Settings:
             vision_api_key_env=vision_key_env,
             vision_timeout_seconds=_int_env("AIVIRTEACH_VISION_TIMEOUT", 12, 3, 30),
             screen_max_per_hour=_int_env("AIVIRTEACH_SCREEN_MAX_PER_HOUR", 10, 0, 120),
-            screen_requests=os.getenv("AIVIRTEACH_SCREEN_REQUESTS", "").strip().lower() in ("1", "true", "yes"),
         )
 
     def vision(self) -> VisionSettings:
@@ -238,6 +235,33 @@ def _unique(items: list) -> list:
     return list(dict.fromkeys(items))
 
 
+SLOW_REQUEST_SECONDS = 25
+# 评估格式不对时，剩余时间至少这么多秒才再要一次评估（一次评估约 5 秒，之后还要写回答）。
+ASSESSMENT_RETRY_MIN_SECONDS = 15
+
+
+def _log_slow_or_failed(request_id, result: "PipelineOutcome", seconds: float, cancelled: bool) -> None:
+    """慢请求或失败请求在日志里留一行各次调用的摘要（阶段、耗时、首字、结束原因），不含任何提示词或输出原文。
+
+    没开监控时（例如服务器测试的阶段 B），这是排查超时和评估失败的唯一线索。
+    """
+    if seconds < SLOW_REQUEST_SECONDS and not result.partial and not cancelled and result.assessment is not None:
+        return
+    calls = []
+    for call in result.calls:
+        took = (call.end_ms - call.start_ms) / 1000 if call.end_ms else None
+        first = (call.first_delta_ms - call.start_ms) / 1000 if call.first_delta_ms else None
+        calls.append(f"{call.phase or '?'}#{call.call}:"
+                     f"{'%.1fs' % took if took is not None else 'unfinished'}"
+                     f"{'/first %.1fs' % first if first is not None else ''}"
+                     f"/{call.finish or call.error or '-'}{'/retry' if getattr(call, 'retries', 0) else ''}")
+    codes = [code for code in result.limitations if CODE_PATTERN.fullmatch(str(code))]
+    LOG.warning("request %s took %.1fs%s; calls=[%s]; tools=%d; codes=%s%s", request_id, seconds,
+                " (cancelled or timed out)" if cancelled else "", ", ".join(calls),
+                sum(1 for event in result.tool_events if event.get("name") == "tool_started"), codes,
+                f"; assessment_error={result.assessment_error}" if result.assessment_error else "")
+
+
 @dataclass
 class PipelineOutcome:
     """一次请求各阶段（评估、收尾、回答）的结果；calls / tool_events 给监控用。"""
@@ -256,7 +280,8 @@ class PipelineOutcome:
     screen_findings: Optional[ScreenFindings] = None  # 返回给 Server 的看图结果
     perception: Optional[Perception] = None  # 完整的看图结果（窗口、页面、报错），交给评估使用
     screen_codes: list = field(default_factory=list)  # 截图没用上时的原因码
-    question_kind: str = ""  # ui / environment / other（platform_screen_flow.classify_question）
+    assessment_error: str = ""  # 评估没通过校验时是哪一类问题（platform_assessment.explain_invalid），不含原文
+    dropped_fields: list = field(default_factory=list)  # 评估里多出、校验前去掉的字段名
 
 
 class Diagnoser:
@@ -282,7 +307,14 @@ class Diagnoser:
     def _pipeline(self, request: ScreenDiagnoseRequest, deadline: float, on_event: Callable[[str, dict], None],
                   cancel: threading.Event) -> PipelineOutcome:
         """在工作线程里依次运行各阶段；阶段事件经 on_event("stage", ...) 交给 SSE。各阶段共用总时限。"""
-        result = PipelineOutcome()
+        result, started = PipelineOutcome(), time.monotonic()
+        try:
+            return self._stages(request, deadline, on_event, cancel, result)
+        finally:
+            _log_slow_or_failed(request.request_id, result, time.monotonic() - started, cancel.is_set())
+
+    def _stages(self, request: ScreenDiagnoseRequest, deadline: float, on_event: Callable[[str, dict], None],
+                cancel: threading.Event, result: PipelineOutcome) -> PipelineOutcome:
 
         def stage(name: str, data: Optional[dict] = None) -> None:
             on_event("stage", {"name": name, "data": data or {}})
@@ -298,26 +330,19 @@ class Diagnoser:
             result.tool_events.extend(outcome.tool_events)
             return outcome
 
-        # 0. 虚拟机画面：检查截图，再交给看图模型；失败不影响后面的诊断和回答。
-        result.screen_codes = self._screen(request, stage, deadline, cancel, result)
-        result.question_kind = classify_question(request.question)
+        # 0. 虚拟机画面：检查截图，再交给看图模型；失败不影响后面的诊断和回答，也不发额外的进度事件。
+        result.screen_codes = self._screen(request, deadline, cancel, result)
         perception = result.perception
 
         def with_view(prompts: tuple) -> tuple:  # 有画面描述时加进评估和收尾的提示词
             return with_screen(prompts, perception, request.response_language) if perception else prompts
-
-        # 界面类问题：画面或课程步骤已经说明学生在哪一步，评估最多 2 次模型调用，不做多轮工具检查。
-        # 只在带了画面、或已打开 AIVIRTEACH_SCREEN_REQUESTS 时这样做；否则与 main 完全相同。
-        ui_mode = result.question_kind == UI and (getattr(request, "screen", None) is not None
-                                                 or self.settings.screen_requests)
-        assessment_calls = min(UI_ASSESSMENT_MODEL_CALLS, self.settings.max_reasoning_turns) if ui_mode else None
 
         # 1. 评估：可以调工具，最后只输出评估 JSON；文字不推送给学生。
         stage("reasoning_started", {"turn": 1})
         text, limitations, partial, budget_stop = None, list(result.screen_codes), False, None
         try:
             assessed = run("assessment", with_view(assessment_prompt(request)),
-                           self.settings.tools(request, max(1, int(deadline - time.monotonic()))), assessment_calls)
+                           self.settings.tools(request, max(1, int(deadline - time.monotonic()))), None)
             result.evidence, result.tool_trace = list(assessed.evidence), list(assessed.tool_trace)
             limitations.extend(assessed.limitations)
             partial, budget_stop = assessed.partial, assessed.budget_stop
@@ -354,9 +379,32 @@ class Diagnoser:
 
         # 3. 校验：结构不对或引用了不存在的证据就不写回答。画面没有观察编号，先去掉对它的引用。
         stage("assessment_validating")
-        if perception:
-            text = drop_screen_reference(text)
-        assessment, evidence, limitations, partial = validate(text, result.evidence, limitations, partial)
+
+        def check(raw: Optional[str]) -> tuple:
+            if perception:
+                raw = drop_screen_reference(raw)
+            raw, dropped = drop_unknown_fields(raw)
+            result.dropped_fields.extend(dropped)
+            return raw, validate(raw, result.evidence, limitations, partial)
+
+        checked_text, (assessment, evidence, new_limitations, new_partial) = check(text)
+        if assessment is None and "MODEL_OUTPUT_UNSTRUCTURED" in new_limitations:
+            result.assessment_error = explain_invalid(checked_text)
+            # 评估格式不对（实测 DeepSeek 偶尔写出括号不配对的 JSON）：时间够的话，不带工具按已有证据再要一次评估。
+            if deadline - time.monotonic() >= ASSESSMENT_RETRY_MIN_SECONDS and not cancel.is_set():
+                stage("finalization_started", {"reason": "assessment_unstructured"})
+                try:
+                    final = run("finalization", with_view(finalization_prompt(request, result.evidence)), None, 1)
+                    if not final.error:
+                        retried_text, retried = check(final.answer)
+                        if retried[0] is not None:
+                            checked_text, (assessment, evidence, new_limitations, new_partial) = retried_text, retried
+                            result.assessment_error += " (retried)"
+                except Exception:
+                    LOG.exception("assessment retry failed for request %s", request.request_id)
+                if cancel.is_set():
+                    return result
+        limitations, partial = new_limitations, new_partial
         result.assessment, result.evidence, result.limitations, result.partial = assessment, evidence, limitations, partial
         if assessment is None:
             stage("answer_failed", {"code": "ASSESSMENT_INVALID"})
@@ -373,8 +421,8 @@ class Diagnoser:
             result.answer_error = "MODEL_STREAM_ERROR"
         return result
 
-    def _screen(self, request: ScreenDiagnoseRequest, stage: Callable[..., None], deadline: float,
-                cancel: threading.Event, result: PipelineOutcome) -> list:
+    def _screen(self, request: ScreenDiagnoseRequest, deadline: float, cancel: threading.Event,
+                result: PipelineOutcome) -> list:
         """检查并看图，返回要记进 limitations 的原因码；看图结果和用量写进 result。"""
         capture = getattr(request, "screen", None)
         if capture is None:
@@ -382,24 +430,19 @@ class Diagnoser:
         try:
             loaded = load_screen(capture)
         except ScreenRejected as rejected:
-            stage(SCREEN_ANALYZED, {"status": "rejected", "code": rejected.code})
             return [rejected.code]
         try:
             if not self.screen_analyzer.enabled:
-                stage(SCREEN_ANALYZED, {"status": "skipped", "code": SCREEN_NOT_ANALYZED})
                 return [SCREEN_NOT_ANALYZED]
             budget = min(self.settings.vision_timeout_seconds,
                          deadline - time.monotonic() - TIME_AFTER_SCREEN_SECONDS)
             if budget < MIN_SCREEN_BUDGET_SECONDS:
-                stage(SCREEN_ANALYZED, {"status": "failed", "code": SCREEN_ANALYSIS_TIMEOUT})
                 return [SCREEN_ANALYSIS_TIMEOUT]
-            stage(SCREEN_ANALYZING)
             outcome = self.screen_analyzer.analyze(
                 loaded, question=request.question, lesson_title=request.current_step.title, lab_id=request.lab_id,
                 language=request.response_language, budget_seconds=budget, cancel=cancel)
         except Exception:  # 看图出任何意外都不能影响诊断
             LOG.exception("screen analysis failed for request %s", request.request_id)
-            stage(SCREEN_ANALYZED, {"status": "failed", "code": SCREEN_ANALYSIS_FAILED})
             return [SCREEN_ANALYSIS_FAILED]
         finally:
             loaded.close()
@@ -407,10 +450,6 @@ class Diagnoser:
         result.usage.extend(outcome.usage)
         result.screen_findings = outcome.findings
         result.perception = outcome.perception if outcome.status == "ok" else None
-        data = {"status": outcome.status, "passes": outcome.passes, "cached": outcome.cached}
-        if outcome.code:
-            data["code"] = outcome.code
-        stage(SCREEN_ANALYZED, data)
         return [outcome.code] if outcome.code else []
 
     async def _diagnose(self, request: ScreenDiagnoseRequest, publish: Optional[Publish],
@@ -490,13 +529,8 @@ class Diagnoser:
                    "screen_findings": outcome.screen_findings}
         screen_attached = getattr(request, "screen", None) is not None
         note = answer_note(screen_attached=screen_attached, screen_used=outcome.perception is not None,
-                           screen_codes=outcome.screen_codes, kind=outcome.question_kind,
-                           requests_enabled=self.settings.screen_requests, language=request.response_language)
-        # 界面类问题没有画面：回答结束后告诉 Client 可以请学生发送画面（开关打开时）。
-        request_screen = outcome.question_kind == UI and not screen_attached and self.settings.screen_requests
+                           screen_codes=outcome.screen_codes, language=request.response_language)
         if assessment is None:  # ASSESSMENT_INVALID 已经推送；与 main 一样只返回兜底文字
-            if request_screen:
-                await emit(SCREEN_REQUESTED, {"reason": "ui_question"})
             return self._response(request, None, limitations, usage, note=note, **details)
         answer = (outcome.answer or "".join(streamed)).strip()
         error = outcome.answer_error
@@ -513,8 +547,6 @@ class Diagnoser:
             await emit("answer_failed", {"code": failure})
             await emit("answer_finished", {"status": "fallback", "character_count": len("".join(streamed)),
                                            "finish_reason": outcome.answer_finish or "unknown"})
-            if request_screen:
-                await emit(SCREEN_REQUESTED, {"reason": "ui_question"})
             fallback = assessment_fallback(assessment, request.response_language)
             return self._response(request, fallback, [*limitations, failure], usage, note=note, **details)
         if note:  # 说明也逐段推送，学生看到的和保存的回答一致
@@ -522,8 +554,6 @@ class Diagnoser:
             await emit("assistant_delta", {"delta": note})
             answer += note
         await emit("answer_finished", {"status": "completed", "character_count": len(answer), "finish_reason": "stop"})
-        if request_screen:
-            await emit(SCREEN_REQUESTED, {"reason": "ui_question"})
         return self._response(request, answer, limitations, usage, completed=not outcome.partial, **details)
 
     @staticmethod
@@ -546,6 +576,17 @@ class Diagnoser:
         )
 
 
+def _remove_leftover_runs(state_dir: Path) -> None:
+    """启动时删除上次进程留下的运行目录（进程被杀时来不及清理）。目录里可能有工具令牌的副本，不能留着。"""
+    if not state_dir.is_dir():
+        return
+    leftovers = [path for path in state_dir.glob("run-*") if path.is_dir() and not path.is_symlink()]
+    for path in leftovers:
+        shutil.rmtree(path, ignore_errors=True)
+    if leftovers:
+        LOG.warning("removed %d leftover DSH run directories from %s", len(leftovers), state_dir)
+
+
 def _sse_event(event: str, data: dict) -> str:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
     return f"event: {event}\ndata: {payload}\n\n"
@@ -566,6 +607,7 @@ def create_app(*, settings: Optional[Settings] = None, runner: Optional[Runner] 
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        _remove_leftover_runs(config.state_dir)
         yield
         monitor.shutdown()  # 退出前发完缓冲的监控数据
 

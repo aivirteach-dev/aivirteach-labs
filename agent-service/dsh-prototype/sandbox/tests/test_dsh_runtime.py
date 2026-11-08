@@ -133,7 +133,26 @@ class DshRuntimeTests(unittest.TestCase):
             outcome = run_once("问题", dsh_settings(proxy, self.state), Recorder())
         [call] = outcome.calls
         self.assertEqual((call.retries, call.finish, outcome.answer), (1, "error", ""))
+        self.assertEqual(outcome.error, "MODEL_PROVIDER_ERROR")
         self.assertEqual(len(app.state.requests), 0)
+
+    def test_silent_call_is_abandoned_and_retried_once(self):
+        """服务器测试里一次调用一直不返回，用光了总时限：首字超时后放弃这次请求，同一次调用重试一次。"""
+        outcome, _, requests = self.run_script([{"stall": 4, "text": ["太迟了"]}, {"text": ["重试后成功"]}],
+                                               first_token_seconds=1)
+        self.assertEqual((outcome.answer, outcome.error), ("重试后成功", None))
+        [call] = outcome.calls
+        self.assertEqual((call.retries, call.finish), (1, "stop"))
+        self.assertEqual(len(requests), 2)
+
+    def test_second_silent_attempt_fails_the_call(self):
+        started = time.monotonic()
+        outcome, _, requests = self.run_script([{"stall": 4}, {"stall": 4}], first_token_seconds=1)
+        self.assertLess(time.monotonic() - started, 3.9)  # 不等上游，两次各 1 秒就放弃
+        [call] = outcome.calls
+        self.assertEqual((call.retries, call.error, outcome.answer), (1, "stream_error", ""))
+        self.assertEqual(outcome.error, "MODEL_PROVIDER_ERROR")  # 不能当成模型的正常（空）输出
+        self.assertEqual(len(requests), 2)
 
     def test_length_finish_is_reported_as_truncated(self):
         outcome, _, _ = self.run_script([{"text": ["前半段"], "finish": "length"}])

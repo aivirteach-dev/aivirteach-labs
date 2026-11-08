@@ -18,7 +18,7 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .dsh_patch import Provider, budget_plugin, provider_plugin, read_budget_stop, render_patch, tool_plugin
+from .dsh_patch import FIRST_TOKEN_SECONDS, Provider, budget_plugin, provider_plugin, read_budget_stop, render_patch, tool_plugin
 from .platform_mcp import ToolContext, provider_tool_name
 
 STREAM_POLL_SECONDS = 0.03
@@ -46,6 +46,7 @@ class DshSettings:
     max_model_calls: int = 4  # 本次 DSH 会话最多调用模型几次
     # 助教规则，作为模型看到的系统消息（经 DSH 的 DSH_SYSTEM_PROMPT）；为空时是 DSH 默认的“软件工程师助手”。
     system_prompt: str = ""
+    first_token_seconds: int = FIRST_TOKEN_SECONDS  # 单次调用多久没输出内容就重试一次（0 表示不限制）
 
     def provider(self) -> Provider:
         if self.provider_kind == "ollama":
@@ -119,9 +120,9 @@ class _StreamTail(threading.Thread):
         end = data.rfind(b"\n") + 1
         self._offset += end
         for line in data[:end].splitlines():
-            self._handle(json.loads(line))
+            self._handle_row(json.loads(line))
 
-    def _handle(self, row: dict) -> None:
+    def _handle_row(self, row: dict) -> None:  # 不能叫 _handle：Python 3.13 的 Thread 用了这个属性名
         call, t = row.get("call"), row.get("t")
         record = self.calls.get(call)
         if row.get("start") is True:
@@ -188,7 +189,8 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
                                         max_model_calls=settings.max_model_calls,
                                         max_output_tokens=settings.max_output_tokens, max_output_bytes=MAX_OUTPUT_BYTES,
                                         deadline_unix=time.time() + settings.total_timeout_seconds,
-                                        allowed_tools=allowed, run_dir=run_dir))
+                                        allowed_tools=allowed, run_dir=run_dir,
+                                        first_token_seconds=settings.first_token_seconds))
         patch = run_dir / "runtime.patch.yml"
         patch.write_text(render_patch(plugins), encoding="utf-8")
         hosts = {urlsplit(provider.base_url).hostname, "localhost", "127.0.0.1"}
@@ -233,6 +235,10 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
             error = "MODEL_BUDGET_EXHAUSTED"
         elif failure is not None:
             raise failure
+        elif finish_reason == "error" or (calls and calls[-1].error == "stream_error"):
+            # 模型调用失败（例如已经开始输出后连接断开，或重试后仍没有任何输出）：DSH 以 error 结束本轮而不抛异常。
+            # 必须报告为错误，否则半截文字会被当成模型的正常输出（服务器测试里表现为 MODEL_OUTPUT_UNSTRUCTURED）。
+            error = "MODEL_STREAM_INCOMPLETE" if answer else "MODEL_PROVIDER_ERROR"
         elif finishes and finishes[-1] in TRUNCATED_FINISHES:
             error = "MODEL_STREAM_OUTPUT_TRUNCATED"
         else:

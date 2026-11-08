@@ -181,3 +181,34 @@ test('no retry after output started, for other error codes, or a second time', a
 test('invalid configuration refuses to mount', () => {
   assert.throws(() => apply({ on() {} }, { maxModelCalls: 1, maxTokens: 1, maxOutputBytes: 1 }), /tutor_budget_config/);
 });
+
+test('a call that outputs nothing within firstTokenMs is abandoned and retried once', async () => {
+  const f = fixture({ firstTokenMs: 30 });
+  let attempts = 0;
+  async function* silentThenReply() {
+    attempts++;
+    if (attempts === 1) {
+      yield { type: 'block-start', blockType: 'text' };  // 不是内容，不算首字
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    yield* reply();
+  }
+  try {
+    const started = Date.now();
+    await consume(f.stream(request(), silentThenReply));
+    assert.ok(Date.now() - started < 1500, 'must not wait for the silent attempt');  // 30ms 放弃 + 300ms 重试间隔
+    assert.equal(attempts, 2);
+    const rows = f.rows().map(({ t, ...rest }) => rest);
+    assert.deepEqual(rows.filter((row) => row.retry), [{ call: 1, retry: 'FIRST_TOKEN_TIMEOUT' }]);
+    assert.deepEqual(rows.filter((row) => row.block), [{ call: 1, block: 'text' }]);  // 放弃的那次不转发
+  } finally { f.close(); }
+});
+
+test('a second silent attempt fails the call', async () => {
+  const f = fixture({ firstTokenMs: 30 });
+  async function* silent() { await new Promise((resolve) => setTimeout(resolve, 200)); yield* reply(); }
+  try {
+    await assert.rejects(consume(f.stream(request(), silent)), /first_token_timeout/);
+    assert.deepEqual(f.rows().map(({ t, ...rest }) => rest).slice(-1), [{ call: 1, error: 'stream_error' }]);
+  } finally { f.close(); }
+});
