@@ -10,13 +10,12 @@ from fastapi.testclient import TestClient
 from dsh_tutor import platform_screen as screen
 from dsh_tutor import platform_vision as vision
 from dsh_tutor.platform_app import create_app
-from dsh_tutor.platform_runtime import RunOutcome
-from dsh_tutor.platform_assessment import validate
-from dsh_tutor.platform_screen_flow import (SCREEN_RULES, answer_note, drop_screen_reference, position_words,
-                                            with_screen)
+from dsh_tutor.platform_runtime import RunOutcome, prompt_text
+from dsh_tutor.platform_assessment import SCREEN_RULES, validate
+from dsh_tutor.platform_screen_flow import answer_note, drop_screen_reference, position_words, with_screen
 from dsh_tutor.platform_vision import Perception
 from dsh_tutor.platform_screen import Highlight
-from test_platform_api import ASSESSMENT, EmptyCourses, answering, body, headers, settings, sse
+from test_platform_api import NO_SCOPES, ASSESSMENT, EmptyCourses, answering, body, headers, settings, sse
 from test_screen import capture
 from test_vision import FakeVision, analyzer, perception
 
@@ -43,7 +42,7 @@ class UnitTests(unittest.TestCase):
 
     def test_screen_block_in_prompts(self):
         system, user = with_screen(("系统", "用户"), sample_perception(), "zh-CN")
-        self.assertTrue(system.startswith("系统") and system.endswith(SCREEN_RULES))
+        self.assertEqual(system, "系统")  # 规则一直在系统消息里，带画面只加数据：DSH 可以和看图同时启动
         block = json.loads(user.split("\n\n", 1)[1])
         observation = block["screen_observation"]
         self.assertEqual((observation["window"], observation["summary"], observation["visible_errors"]),
@@ -83,7 +82,7 @@ class FlowTests(unittest.TestCase):
         calls = []
         tool = analyzer(FakeVision(*vision_script), api_key_env=None)
         client = TestClient(create_app(
-            settings=settings(model_provider="openai_compatible", model_api_key_set=True, total_timeout_seconds=40),
+            scopes=NO_SCOPES, settings=settings(model_provider="openai_compatible", model_api_key_set=True, total_timeout_seconds=40),
             runner=runner(calls) if runner else answering("在右上角。", calls=calls, assessment=assessment),
             course_repository=EmptyCourses(), screen_analyzer=tool))
         payload = body(question=question, **({"screen": capture().model_dump(mode="json")} if screen_attached else {}))
@@ -96,17 +95,18 @@ class FlowTests(unittest.TestCase):
             stage, system, prompt, tools, max_calls = calls[0]
             self.assertEqual((stage, max_calls), ("assessment", 4), question)  # 和不带截图相同的预算
             self.assertIn("screen_observation", prompt); self.assertIn("右上", prompt)
-            self.assertIn(SCREEN_RULES.strip()[:20], system)
+            self.assertIn(SCREEN_RULES, system)
             self.assertNotIn(capture().data[:60], prompt)  # 提示词里只有文字描述，没有图片
             self.assertNotIn("screen_observation", calls[1][2])  # 回答阶段只看校验过的评估（与 main 相同）
             self.assertEqual((result["status"], result["answer"]), ("completed", "在右上角。"))
             self.assertEqual(result["screen_findings"]["highlights"][0]["label"], "Create Workflow")
 
     def test_with_and_without_screen_send_the_same_events(self):
-        with_screen_frames, _, _ = self.run_flow(UI_QUESTION)
+        with_screen_frames, screen_calls, _ = self.run_flow(UI_QUESTION)
         plain_frames, calls, result = self.run_flow(UI_QUESTION, screen_attached=False)
         self.assertEqual([e for e, _ in with_screen_frames], [e for e, _ in plain_frames])
         self.assertNotIn("screen_observation", calls[0][2])
+        self.assertEqual(screen_calls[0][1], calls[0][1])  # 系统消息相同：不等看图结果，也总能命中缓存
         self.assertEqual(result["answer"], "在右上角。")  # 不带截图时没有任何提示语
 
     def test_screen_reference_does_not_invalidate_the_assessment(self):
@@ -118,6 +118,7 @@ class FlowTests(unittest.TestCase):
     def test_finalization_also_sees_the_screen(self):
         def exhausted(calls):
             def runner(prompt, dsh, on_event, cancel, tools):
+                prompt = prompt_text(prompt)
                 if not calls:  # 评估阶段：检查次数用完，没有给出评估
                     calls.append(("assessment", dsh.system_prompt, prompt, tools, dsh.max_model_calls))
                     return RunOutcome("", None, [], "MODEL_BUDGET_EXHAUSTED", budget_stop="model_calls")

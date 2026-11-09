@@ -1,8 +1,13 @@
-"""平台工具的 MCP 桥：DSH 每次请求启动一个，按 Server 给的 diagnostic_scope 校验后调用 Diagnostic Gateway。
+"""平台工具的 MCP 桥：DSH 每次请求启动一个，按本次请求的 diagnostic_scope 校验后调用 Diagnostic Gateway。
 
 校验规则、脱敏、证据编号、调用次数上限和错误码都与 main 的 orchestrator 一致。
 不开放网络端口；stdout 只用于 MCP 协议，结果另写入本请求的事件文件交给平台接口。
 启动：python -m dsh_tutor.platform_mcp <context.json>（文件含诊断令牌，权限 0600，随请求临时目录删除）。
+
+预先检查（platform_precheck.py）在平台接口进程里用同一个 ToolBridge 调 Gateway，规则完全相同；
+做完后把证据编号和结果写进 prefetch 文件，工具桥第一次被调用时读入：编号接着往下排，
+模型再调相同的检查直接用已有结果（status=cached），不再访问 Gateway。预先检查不占模型的工具次数
+（AIVIRTEACH_MAX_TOOL_CALLS 仍是 main 的含义：模型能调几次工具）。
 """
 from __future__ import annotations
 
@@ -12,7 +17,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -46,6 +51,15 @@ class ToolContext(BaseModel):
     tool_timeout_seconds: int = 8
     max_tool_calls: int = 6
     max_tool_output_chars: int = 32_768
+    prefetch_path: str = ""  # 预先检查的状态（Prefetch），DSH 开始提问前写入；没有就从零开始
+
+
+class Prefetch(BaseModel):
+    """预先检查的证据编号和结果；交给 DSH 里的工具桥接着用。"""
+
+    model_config = ConfigDict(extra="forbid")
+    evidence_count: int = Field(ge=0)
+    cache: list = Field(default_factory=list)  # [{"key": ..., "observation": Evidence, "payload": ...}]
 
 
 class GatewayError(RuntimeError):
@@ -75,14 +89,36 @@ def _safe_event_tool_name(value: str) -> str:
 class ToolBridge:
     """一次请求内的工具调用：计数、校验、同参数缓存、调用 Gateway、记录证据。"""
 
-    def __init__(self, context: ToolContext, client: Optional[httpx.AsyncClient] = None) -> None:
+    def __init__(self, context: ToolContext, client: Optional[httpx.AsyncClient] = None,
+                 sink: Optional[Callable[[dict], None]] = None) -> None:
         self.ctx = context
         self.client = client or httpx.AsyncClient(timeout=context.tool_timeout_seconds, trust_env=False)
         self.used = 0
         self.evidence_count = 0
         self.cache: dict = {}
+        self.sink = sink  # 不为空时事件交给它（预先检查），否则写事件文件（DSH 里的工具桥）
+        self._prefetch_loaded = not context.prefetch_path
+
+    def prefetch(self) -> Prefetch:
+        return Prefetch(evidence_count=self.evidence_count,
+                        cache=[{"key": key, "observation": observation.model_dump(mode="json"), "payload": payload}
+                               for key, (observation, payload) in self.cache.items()])
+
+    def _load_prefetch(self) -> None:
+        """第一次调用时读入预先检查的状态。文件由平台接口在发出提问前写好；不存在表示没有预先检查。"""
+        self._prefetch_loaded = True
+        path = Path(self.ctx.prefetch_path)
+        if not path.is_file():
+            return
+        state = Prefetch.model_validate_json(path.read_bytes())
+        self.evidence_count += state.evidence_count
+        for item in state.cache:
+            self.cache[item["key"]] = (Evidence.model_validate(item["observation"]), item["payload"])
 
     def _write(self, row: dict) -> None:
+        if self.sink is not None:
+            self.sink({"t": int(time.time() * 1000), **row})
+            return
         line = (json.dumps({"t": int(time.time() * 1000), **row}, ensure_ascii=False, default=str) + "\n").encode("utf-8")
         fd = os.open(self.ctx.events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
@@ -129,6 +165,8 @@ class ToolBridge:
         return body
 
     async def call(self, name: str, raw_arguments: dict) -> dict:
+        if not self._prefetch_loaded:
+            self._load_prefetch()
         started = time.monotonic()
         event_tool = _safe_event_tool_name(name)
         if self.used >= self.ctx.max_tool_calls:

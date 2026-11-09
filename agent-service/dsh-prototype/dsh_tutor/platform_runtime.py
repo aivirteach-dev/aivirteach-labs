@@ -4,6 +4,9 @@
 - 文字片段、用量、结束原因：预算插件拦截 llm/stream 后写入事件文件（SDK 公开通知只给整段回答）。
 - 工具事件、证据、调用记录：platform_mcp 工具桥写入同一个事件文件。
 每条事件带毫秒时间戳，RunOutcome.calls 据此给出每次模型调用的耗时和首字延迟（供监控使用）。
+
+提问可以是 LatePrompt：DSH 启动（起进程、加载插件、连工具桥，约 1.5～2.5 秒）的同时在当前线程里准备提问
+（预先检查、看图），两边都好了再发出。系统消息在启动时就要定下来，所以不能依赖准备的结果。
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .dsh_patch import FIRST_TOKEN_SECONDS, Provider, budget_plugin, provider_plugin, read_budget_stop, render_patch, tool_plugin
-from .platform_mcp import ToolContext, provider_tool_name
+from .platform_mcp import Prefetch, ToolContext, provider_tool_name
 
 STREAM_POLL_SECONDS = 0.03
 MAX_STREAM_FILE_BYTES = 4_194_304
@@ -28,6 +31,18 @@ TRUNCATED_FINISHES = {"length", "max-tokens"}
 
 # on_event(kind, data)：kind 为 start / delta / block / finish / error / tool_event
 EventCallback = Callable[[str, dict], None]
+
+
+@dataclass
+class LatePrompt:
+    """和 DSH 启动同时准备的提问：build() 返回 (用户消息, 预先检查的状态或 None)。"""
+
+    build: Callable[[], tuple]
+
+
+def prompt_text(prompt) -> str:
+    """测试和 fake 提供方用：直接拿到最终的用户消息（LatePrompt 当场准备）。"""
+    return prompt.build()[0] if isinstance(prompt, LatePrompt) else prompt
 
 
 @dataclass(frozen=True)
@@ -162,9 +177,11 @@ class _StreamTail(threading.Thread):
             self.partial = True
 
 
-def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
+def run_once(prompt, settings: DshSettings, on_event: EventCallback,
              cancel: Optional[threading.Event] = None, tools: Optional[ToolContext] = None) -> RunOutcome:
-    """阻塞执行一次 DSH 对话，应在工作线程中调用。tools 为 None 时不提供任何工具。"""
+    """阻塞执行一次 DSH 对话，应在工作线程中调用。tools 为 None 时不提供任何工具。
+
+    prompt 是字符串或 LatePrompt（见模块说明）。"""
     import time
 
     from deepseek_harness import DeepSeekHarness
@@ -183,7 +200,8 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
             context_path = run_dir / "tools.json"
             fd = os.open(context_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(tools.model_copy(update={"events_path": str(stream_path)}).model_dump_json())
+                handle.write(tools.model_copy(update={"events_path": str(stream_path),
+                                                      "prefetch_path": str(run_dir / "prefetch.json")}).model_dump_json())
             plugins.append(tool_plugin(context_path, tools.tool_timeout_seconds))
         plugins.insert(1, budget_plugin(provider_id=provider.id, model=settings.model,
                                         max_model_calls=settings.max_model_calls,
@@ -205,7 +223,7 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
         tail.start()
         answer, finish_reason, failure = "", None, None
         try:
-            with DeepSeekHarness(
+            harness = DeepSeekHarness(
                 dsh_home=str(run_dir / "home"),
                 cwd=str(run_dir),
                 profile="sdk-minimal",
@@ -216,14 +234,20 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
                 reasoning_effort="off" if settings.reasoning_off else None,
                 max_tokens=settings.max_output_tokens,
                 request_timeout_seconds=settings.total_timeout_seconds,
-            ) as harness:
-                harness.start()
+            )
+            try:
+                text = _start_while_preparing(harness, prompt, run_dir)
                 read_budget_stop(run_dir)  # 约束没有挂载就不发第一条消息
-                try:
-                    result = harness.run(prompt, session_id="request-" + uuid4().hex)
-                    answer, finish_reason = result.final_response, result.finish_reason
-                except Exception as exc:  # 预算插件或取消中断时，DSH 可能以异常结束本轮
-                    failure = exc
+                if cancel is not None and cancel.is_set():  # 准备期间已取消（超时或断开）：不再发出提问
+                    cancel_path.touch()
+                else:
+                    try:
+                        result = harness.run(text, session_id="request-" + uuid4().hex)
+                        answer, finish_reason = result.final_response, result.finish_reason
+                    except Exception as exc:  # 预算插件或取消中断时，DSH 可能以异常结束本轮
+                        failure = exc
+            finally:
+                harness.close()
         finally:
             tail.stop()
         calls = [tail.calls[k] for k in sorted(tail.calls)]
@@ -248,3 +272,35 @@ def run_once(prompt: str, settings: DshSettings, on_event: EventCallback,
                           budget_stop)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _start_while_preparing(harness, prompt, run_dir: Path) -> str:
+    """启动 DSH；提问是 LatePrompt 时同时在当前线程里准备，返回最终的用户消息。启动失败时抛出启动的异常。"""
+    if not isinstance(prompt, LatePrompt):
+        harness.start()
+        return prompt
+    failure: list = []
+
+    def start() -> None:
+        try:
+            harness.start()
+        except BaseException as exc:  # 交回调用线程抛出
+            failure.append(exc)
+
+    starter = threading.Thread(target=start, name="dsh-start", daemon=True)
+    starter.start()
+    try:
+        text, prefetch = prompt.build()
+        if prefetch is not None:
+            _write_prefetch(run_dir / "prefetch.json", prefetch)
+    finally:
+        starter.join()
+    if failure:
+        raise failure[0]
+    return text
+
+
+def _write_prefetch(path: Path, prefetch: Prefetch) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(prefetch.model_dump_json())

@@ -1,0 +1,35 @@
+{
+  "courses": [
+    {
+      "course_ids": ["ai-daily-briefing", "n8n-agent-builder"],
+      "scope": {
+        "workspace_root": "/home/learner/aivirteach/ai-daily-briefing",
+        "allowed_tools": ["get_vm_status", "get_guest_agent_status", "get_guest_service_status",
+                          "list_guest_containers", "get_guest_container_status", "get_guest_container_logs",
+                          "check_guest_port", "list_course_files", "read_course_file"],
+        "allowed_relative_paths": [".", "compose.yaml"],
+        "allowed_services": ["docker.service"],
+        "allowed_containers": ["ai-daily-briefing-n8n"],
+        "allowed_ports": [5678]
+      },
+      "prechecks": [
+        {"tool": "get_vm_status"},
+        {"tool": "get_guest_container_status", "arguments": {"container": "ai-daily-briefing-n8n"}},
+        {"tool": "check_guest_port", "arguments": {"port": 5678}}
+      ],
+      "lessons": [
+        {
+          "lesson_ids": ["install-docker"],
+          "prechecks": [
+            {"tool": "get_vm_status"},
+            {"tool": "get_guest_service_status", "arguments": {"service": "docker.service"}}
+          ]
+        }
+      ]
+    }
+  ],
+  "default_prechecks": [
+    {"tool": "get_vm_status"},
+    {"tool": "get_guest_agent_status"}
+  ]
+}

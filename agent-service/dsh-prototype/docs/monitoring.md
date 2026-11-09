@@ -10,7 +10,7 @@ Agent 按 OpenTelemetry 标准发送监控数据（`dsh_tutor/telemetry.py`）�
 |---|---|---|
 | `invoke_agent aivirteach-tutor` | AGENT | 整个请求：request_id、lab_id、课程和课时、是否流式、返回状态、限制码（只记原因码，不记模型写的说明句子）、评估没通过校验时的类别（`aivirteach.assessment_error`，如 `schema:diagnosis.confidence:enum`，不含原文）、模型调用次数、工具调用次数、排队时间、首字延迟、总耗时 |
 | `chat <模型>` | LLM | 每次模型调用：所属阶段（`aivirteach.phase`：screen（看图，span 名用看图模型的名字）/ assessment / finalization / answer）、连接类错误后的重试次数（`aivirteach.retries`）、耗时、首字延迟、输入/输出/缓存命中 token、结束原因、失败原因（含提供方返回的 error / aborted） |
-| `execute_tool <工具>` | TOOL | 每次工具调用：耗时、结果状态（ok/cached/denied/error）、错误码、证据编号 |
+| `execute_tool <工具>` | TOOL | 每次工具调用（含 DSH 启动时的预先检查，见 README“工具范围和预先检查”）：耗时、结果状态（ok/cached/denied/error）、错误码、证据编号 |
 
 - 时间来自事件文件里的毫秒时间戳，请求结束后一次性补记，不拖慢回答。超时或调用方断开时，等 DSH 真正停下再记，所以这些情况也能看到每次调用的情况。
 - 属性同时写 OpenTelemetry GenAI 约定（`gen_ai.*`）和 OpenInference 约定（`llm.token_count.*` 等）。Phoenix 直接识别后者，包括缓存命中 token。输入 token 按两套约定的要求包含缓存命中部分。

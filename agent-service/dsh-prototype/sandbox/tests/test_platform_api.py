@@ -17,12 +17,15 @@ from dsh_tutor.platform_app import Diagnoser, Settings, create_app, normalize_ba
 from dsh_tutor.platform_assessment import (FINALIZATION_RULES, answer_prompt, assessment_fallback,
                                            assessment_prompt, is_answer_stage, parse_assessment)
 from dsh_tutor.platform_mcp import ToolBridge, ToolContext
-from dsh_tutor.platform_runtime import RunOutcome
+from dsh_tutor.platform_precheck import ScopeConfig
+from dsh_tutor.platform_runtime import RunOutcome, prompt_text
 
 ROOT = Path(__file__).resolve().parents[2]
 MAIN_AGENT = ROOT.parent / "aivirteach_agent"
 TOKEN = "t" * 40
 GATEWAY_TOKEN = "g" * 40
+# 不做预先检查（没有课程工具范围配置）：这些测试对比的是 main 的流程；预先检查在 test_precheck.py 里测。
+NO_SCOPES = ScopeConfig()
 # Client 的 read-tutor-stream.ts 认识的事件，加上 Server 自己处理的 result / error。
 CLIENT_EVENTS = {"accepted", "started", "reasoning_started", "reasoning_finished", "context_ready", "tool_started",
                  "tool_finished", "finalization_started", "assessment_validating", "assessment_validated",
@@ -56,6 +59,7 @@ def answering(*pieces, finish="completed", assessment=None, calls=None, **assess
     """两阶段的假运行：评估阶段返回评估 JSON（默认 ASSESSMENT，assessed 是评估阶段 RunOutcome 的其他字段），
     回答阶段逐段输出 pieces。calls 记录每次调用时的 (阶段, 系统消息, 用户消息, 工具, 调用上限)。"""
     def runner(prompt, dsh, on_event, cancel, tools):
+        prompt = prompt_text(prompt)  # 和 DSH 启动同时准备的提问（预先检查、看图）在这里当场完成
         if calls is not None:
             calls.append(("answer" if is_answer_stage(dsh.system_prompt) else "assessment", dsh.system_prompt, prompt,
                           tools, dsh.max_model_calls))
@@ -86,7 +90,7 @@ class EmptyCourses:
 
 
 def client(runner=None, **overrides):
-    return TestClient(create_app(settings=settings(**overrides), runner=runner or answering("你好", "，世界"),
+    return TestClient(create_app(scopes=NO_SCOPES, settings=settings(**overrides), runner=runner or answering("你好", "，世界"),
                                  course_repository=EmptyCourses()))
 
 
@@ -560,7 +564,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn(GATEWAY_TOKEN, repr(settings())); self.assertNotIn(TOKEN, repr(settings()))
 
     def test_fake_provider_needs_no_model_and_streams(self):
-        app = create_app(settings=settings(model_provider="fake", model_base_url="", model_name=""),
+        app = create_app(scopes=NO_SCOPES, settings=settings(model_provider="fake", model_base_url="", model_name=""),
                          course_repository=EmptyCourses())
         c = TestClient(app)
         self.assertEqual(c.get("/ready").json()["provider"], "fake")
@@ -577,7 +581,7 @@ class DeploymentConfigTests(unittest.TestCase):
             def enrich(self, request):
                 seen["lesson"] = request.current_step.lesson_id
                 return request
-        c = TestClient(create_app(settings=settings(), runner=answering("好"), course_repository=Courses()))
+        c = TestClient(create_app(scopes=NO_SCOPES, settings=settings(), runner=answering("好"), course_repository=Courses()))
         self.assertEqual(c.get("/ready").json()["processed_courses"], 3)
         c.post("/v1/agent/diagnose", json=body(), headers=headers())
         self.assertEqual(seen, {"lesson": "install-n8n"})

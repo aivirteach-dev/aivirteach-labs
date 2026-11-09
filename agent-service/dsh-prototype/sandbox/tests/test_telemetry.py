@@ -20,7 +20,7 @@ from dsh_tutor.platform_app import Diagnoser, create_app
 from dsh_tutor.platform_assessment import is_answer_stage
 from dsh_tutor.platform_runtime import ModelCall, RunOutcome
 from dsh_tutor.telemetry import RequestTrace, Telemetry, provider_name, tracing_requested
-from test_platform_api import EmptyCourses, body, headers, settings
+from test_platform_api import NO_SCOPES, EmptyCourses, body, headers, settings
 
 USAGE = {"inputTokens": 40, "outputTokens": 12, "totalTokens": 132, "cacheReadTokens": 80}
 
@@ -60,7 +60,7 @@ def spans_by_kind(exporter):
 
 class SpanTests(unittest.TestCase):
     def run_app(self, runner, telemetry, **overrides):
-        app = create_app(settings=settings(**overrides), runner=runner, course_repository=EmptyCourses(),
+        app = create_app(scopes=NO_SCOPES, settings=settings(**overrides), runner=runner, course_repository=EmptyCourses(),
                          telemetry=telemetry)
         return TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers()).json()
 

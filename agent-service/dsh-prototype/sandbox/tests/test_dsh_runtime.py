@@ -10,11 +10,13 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from dsh_tutor import dsh_patch, platform_models
 from dsh_tutor.platform_app import normalize_usage
 from dsh_tutor.platform_mcp import ToolContext
-from dsh_tutor.platform_runtime import DshSettings, run_once
+from dsh_tutor import platform_precheck as precheck
+from dsh_tutor.platform_runtime import DshSettings, LatePrompt, run_once
 from sandbox import fake_gateway, fake_model
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -60,11 +62,11 @@ class DshRuntimeTests(unittest.TestCase):
         self.state = tempfile.mkdtemp(prefix="dsh-test-")
         self.addCleanup(shutil.rmtree, self.state, True)
 
-    def run_script(self, script, tools=None, cancel=None, on_event=None, **overrides):
+    def run_script(self, script, tools=None, cancel=None, on_event=None, prompt="问题", **overrides):
         app = fake_model.create_app(script)
         recorder = on_event or Recorder()
         with fake_model.serve(app) as url:
-            outcome = run_once("问题", dsh_settings(url, self.state, **overrides), recorder, cancel, tools(url) if tools else None)
+            outcome = run_once(prompt, dsh_settings(url, self.state, **overrides), recorder, cancel, tools(url) if tools else None)
         self.assertEqual(os.listdir(self.state), [], "run directory must be removed")
         return outcome, recorder, app.state.requests
 
@@ -153,6 +155,51 @@ class DshRuntimeTests(unittest.TestCase):
         self.assertEqual((call.retries, call.error, outcome.answer), (1, "stream_error", ""))
         self.assertEqual(outcome.error, "MODEL_PROVIDER_ERROR")  # 不能当成模型的正常（空）输出
         self.assertEqual(len(requests), 2)
+
+    def test_late_prompt_is_prepared_while_dsh_starts(self):
+        import deepseek_harness
+        original = deepseek_harness.DeepSeekHarness.start
+
+        def slow_start(harness):  # 让启动固定多花 1 秒，结果不受机器快慢影响
+            time.sleep(1.0)
+            return original(harness)
+
+        def build():
+            time.sleep(1.0)  # 例如预先检查和看图
+            return "准备好的问题", None
+        with mock.patch.object(deepseek_harness.DeepSeekHarness, "start", slow_start):
+            started = time.monotonic()
+            self.run_script([{"text": ["好"]}])
+            plain = time.monotonic() - started
+            started = time.monotonic()
+            outcome, _, requests = self.run_script([{"text": ["好"]}], prompt=LatePrompt(build))
+            late = time.monotonic() - started
+        self.assertEqual(outcome.answer, "好")
+        self.assertEqual([m["content"] for m in requests[0]["messages"] if m["role"] == "user"][0], "准备好的问题")
+        self.assertLess(late, plain + 0.5, (plain, late))  # 准备和启动同时进行；先后相加会多 1 秒
+
+    def test_prechecks_are_handed_to_the_tool_bridge(self):
+        allowed = ("get_vm_status", "get_guest_agent_status")
+        with fake_model.serve(fake_gateway.app) as gateway:
+            done = precheck.run([precheck.Check(tool="get_vm_status")], self.tools(gateway, allowed), lambda *_: None)
+            fake_gateway.app.state.calls.clear()
+            outcome, _, _ = self.run_script(
+                [{"tool": "get_vm_status"}, {"tool": "get_guest_agent_status"}, {"text": ["好"]}],
+                tools=lambda _: self.tools(gateway, allowed), prompt=LatePrompt(lambda: ("问题", done.prefetch)))
+            gateway_calls = [tool for _, tool in fake_gateway.app.state.calls]
+        self.assertEqual([(t["tool"], t["status"], t.get("observation_id")) for t in outcome.tool_trace],
+                         [("get_vm_status", "cached", "obs-001"), ("get_guest_agent_status", "ok", "obs-002")])
+        self.assertEqual([e["id"] for e in outcome.evidence], ["obs-002"])  # 预先检查的证据由调用方保存
+        self.assertEqual(gateway_calls, ["get_guest_agent_status"])  # 重复的检查不再访问 Gateway
+
+    def test_cancel_during_preparation_sends_no_prompt(self):
+        cancel = threading.Event()
+
+        def build():
+            cancel.set()  # 例如准备期间总时限到了
+            return "问题", None
+        outcome, _, requests = self.run_script([{"text": ["不会到这里"]}], cancel=cancel, prompt=LatePrompt(build))
+        self.assertEqual((outcome.error, requests), ("CANCELLED", []))
 
     def test_length_finish_is_reported_as_truncated(self):
         outcome, _, _ = self.run_script([{"text": ["前半段"], "finish": "length"}])

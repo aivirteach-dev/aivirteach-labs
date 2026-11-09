@@ -14,7 +14,7 @@ from dsh_tutor.platform_app import create_app
 from dsh_tutor.platform_assessment import is_answer_stage
 from dsh_tutor.platform_runtime import RunOutcome
 from dsh_tutor.platform_assessment import drop_unknown_fields, explain_invalid
-from test_platform_api import ASSESSMENT, EmptyCourses, answering, body, headers, settings, sse
+from test_platform_api import NO_SCOPES, ASSESSMENT, EmptyCourses, answering, body, headers, settings, sse
 from test_telemetry import memory_telemetry, spans_by_kind
 
 
@@ -57,7 +57,7 @@ class DropUnknownFieldsTests(unittest.TestCase):
     def test_the_answer_is_written_and_the_drop_is_recorded(self):
         telemetry, exporter = memory_telemetry()
         extra = {**ASSESSMENT, "course_alignment_note": ""}
-        app = create_app(settings=settings(), runner=answering("好", assessment=extra),
+        app = create_app(scopes=NO_SCOPES, settings=settings(), runner=answering("好", assessment=extra),
                          course_repository=EmptyCourses(), telemetry=telemetry)
         data = TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers()).json()
         self.assertEqual(data["answer"], "好")
@@ -82,7 +82,7 @@ class RetryTests(unittest.TestCase):
         telemetry, exporter = memory_telemetry()
         calls = []
         broken = '{"diagnosis": {"summary": "容器已退出", "probable_causes": []]}, "limitations": []}'  # 括号不配对
-        app = create_app(settings=settings(total_timeout_seconds=40), runner=self.runner(broken, calls),
+        app = create_app(scopes=NO_SCOPES, settings=settings(total_timeout_seconds=40), runner=self.runner(broken, calls),
                          course_repository=EmptyCourses(), telemetry=telemetry)
         frames = sse(TestClient(app).post("/v1/agent/diagnose/stream", json=body(), headers=headers()).text)
         result = frames[-2][1]["response"]
@@ -95,7 +95,7 @@ class RetryTests(unittest.TestCase):
 
     def test_no_retry_when_time_is_short(self):
         calls = []
-        app = create_app(settings=settings(total_timeout_seconds=10), runner=self.runner("不是 JSON", calls),
+        app = create_app(scopes=NO_SCOPES, settings=settings(total_timeout_seconds=10), runner=self.runner("不是 JSON", calls),
                          course_repository=EmptyCourses())
         data = TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers()).json()
         self.assertEqual(calls, ["assessment"])
@@ -107,7 +107,7 @@ class PipelineRecordTests(unittest.TestCase):
         telemetry, exporter = memory_telemetry()
         bad = {**ASSESSMENT, "diagnosis": {"summary": "容器已退出（不应出现在日志里）", "probable_causes": [],
                                            "confidence": "很高"}}
-        app = create_app(settings=settings(), runner=answering("好", assessment=bad), course_repository=EmptyCourses(),
+        app = create_app(scopes=NO_SCOPES, settings=settings(), runner=answering("好", assessment=bad), course_repository=EmptyCourses(),
                          telemetry=telemetry)
         with self.assertLogs("aivirteach.dsh_agent", "WARNING") as logs:
             data = TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers()).json()
@@ -121,14 +121,14 @@ class PipelineRecordTests(unittest.TestCase):
         self.assertEqual(root.attributes["aivirteach.assessment_error"], "schema:diagnosis.confidence:enum")
 
     def test_fast_successful_requests_are_not_logged(self):
-        app = create_app(settings=settings(), runner=answering("好"), course_repository=EmptyCourses())
+        app = create_app(scopes=NO_SCOPES, settings=settings(), runner=answering("好"), course_repository=EmptyCourses())
         with self.assertNoLogs("aivirteach.dsh_agent", "WARNING"):
             TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers())
 
     def test_trace_keeps_only_reason_codes(self):
         telemetry, exporter = memory_telemetry()
         wordy = {**ASSESSMENT, "limitations": ["只读工具看不到学生浏览器访问的地址"]}
-        app = create_app(settings=settings(), runner=answering("好", assessment=wordy), course_repository=EmptyCourses(),
+        app = create_app(scopes=NO_SCOPES, settings=settings(), runner=answering("好", assessment=wordy), course_repository=EmptyCourses(),
                          telemetry=telemetry)
         data = TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers()).json()
         self.assertIn("只读工具看不到学生浏览器访问的地址", data["limitations"])  # 返回给 Server 的不变（与 main 相同）
@@ -142,7 +142,7 @@ class PromptOrderTests(unittest.TestCase):
     def test_stable_parts_come_before_the_question(self):
         """DeepSeek 按开头相同的部分命中缓存：课程资料要在学生问题之前。"""
         calls = []
-        app = create_app(settings=settings(), runner=answering("好", calls=calls), course_repository=EmptyCourses())
+        app = create_app(scopes=NO_SCOPES, settings=settings(), runner=answering("好", calls=calls), course_repository=EmptyCourses())
         TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers())
         for stage, system, prompt, tools, limit in calls:
             keys = list(json.loads(prompt.split("\n\n", 1)[0]))
@@ -157,7 +157,7 @@ class StartupTests(unittest.TestCase):
         (state / "run-old").mkdir()
         (state / "run-old" / "tools.json").write_text('{"gateway_token": "x"}')
         (state / "keep-me").mkdir()
-        app = create_app(settings=settings(state_dir=state), runner=answering("好"), course_repository=EmptyCourses())
+        app = create_app(scopes=NO_SCOPES, settings=settings(state_dir=state), runner=answering("好"), course_repository=EmptyCourses())
         with self.assertLogs("aivirteach.dsh_agent", "WARNING"), TestClient(app):
             pass
         self.assertEqual(sorted(p.name for p in state.iterdir()), ["keep-me"])

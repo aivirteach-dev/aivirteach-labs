@@ -18,7 +18,7 @@ from dsh_tutor import platform_vision as vision
 from dsh_tutor.platform_app import Settings, create_app
 from dsh_tutor.platform_screen import load_screen
 from dsh_tutor.platform_vision import ScreenAnalyzer, VisionSettings
-from test_platform_api import EmptyCourses, answering, body, headers, settings, sse
+from test_platform_api import NO_SCOPES, EmptyCourses, answering, body, headers, settings, sse
 from test_screen import capture, image_bytes
 
 VISION = VisionSettings(model="vision-test", base_url="http://vision.test/v1", api_key_env="VISION_TEST_KEY",
@@ -271,7 +271,7 @@ class PipelineTests(unittest.TestCase):
         values = dict(model_provider="openai_compatible", model_api_key_set=True, total_timeout_seconds=40)
         values.update(overrides)
         tool = analyzer(fake, api_key_env=None)
-        return TestClient(create_app(settings=settings(**values), runner=runner or answering("好"),
+        return TestClient(create_app(scopes=NO_SCOPES, settings=settings(**values), runner=runner or answering("好"),
                                      course_repository=EmptyCourses(), screen_analyzer=tool))
 
     def stream(self, client, payload):
@@ -313,7 +313,7 @@ class PipelineTests(unittest.TestCase):
         from test_telemetry import memory_telemetry, spans_by_kind
         telemetry, exporter = memory_telemetry(capture_content=True)
         tool = analyzer(FakeVision(), api_key_env=None)
-        app = create_app(settings=settings(model_provider="openai_compatible", model_api_key_set=True,
+        app = create_app(scopes=NO_SCOPES, settings=settings(model_provider="openai_compatible", model_api_key_set=True,
                                            total_timeout_seconds=40),
                          runner=answering("好"), course_repository=EmptyCourses(), telemetry=telemetry,
                          screen_analyzer=tool)

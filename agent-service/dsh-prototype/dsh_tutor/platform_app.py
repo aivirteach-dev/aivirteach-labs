@@ -2,7 +2,9 @@
 
 接口、请求/返回格式、鉴权、SSE 事件名与帧格式、环境变量均以 agent-service/aivirteach_agent
 为准，Server 和 Client 不需要任何改动。启动见 start_platform.sh。
-唯一的扩展是可选的虚拟机画面（请求 screen / 返回 screen_findings，见 platform_screen.py）；不带时与 main 相同。
+接口上唯一的扩展是可选的虚拟机画面（请求 screen / 返回 screen_findings，见 platform_screen.py）。
+内部与 main 的不同：Server 没给工具范围时按课程配置确定，并在 DSH 启动的同时先做好基本检查
+（platform_precheck.py）；看图也和 DSH 启动同时进行。事件名、顺序和返回格式不变。
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from . import platform_precheck as precheck
 from .platform_course import CourseRepository
 from .platform_mcp import ToolContext
 from .platform_assessment import (MAX_ANSWER_CHARS, answer_prompt, assessment_fallback, assessment_prompt,
@@ -35,7 +38,7 @@ from .platform_assessment import (MAX_ANSWER_CHARS, answer_prompt, assessment_fa
                                   validate)
 from .platform_models import (CourseAlignment, DiagnoseRequest, Diagnosis, DiagnosticAssessment,
                               Evidence, ToolTrace, Usage)
-from .platform_runtime import DshSettings, RunOutcome, run_once
+from .platform_runtime import DshSettings, LatePrompt, RunOutcome, run_once
 from .platform_screen import (SCREEN_NOT_ANALYZED, BodySizeLimit, ScreenDiagnoseRequest, ScreenDiagnoseResponse, ScreenFindings, ScreenRejected,
                               load_screen, validation_error_handler)
 from .platform_screen_flow import answer_note, drop_screen_reference, with_screen
@@ -288,9 +291,11 @@ class Diagnoser:
     """一次请求：排队 → 评估（DSH + 工具，不显示）→ 校验 → 回答（DSH，逐段推送）→ 组装 DiagnoseResponse。"""
 
     def __init__(self, settings: Settings, runner: Runner, courses: CourseRepository,
-                 telemetry: Optional[Telemetry] = None, screen_analyzer: Optional[ScreenAnalyzer] = None):
+                 telemetry: Optional[Telemetry] = None, screen_analyzer: Optional[ScreenAnalyzer] = None,
+                 scopes: Optional[precheck.ScopeConfig] = None):
         self.settings, self.runner, self.courses = settings, runner, courses
         self.telemetry = telemetry or Telemetry()
+        self.scopes = scopes if scopes is not None else precheck.load_config()
         # 进程内共用一个：同一张图的结果复用、每台 VM 的看图次数限制都在这里。
         self.screen_analyzer = screen_analyzer or ScreenAnalyzer(settings.vision())
         self.slots = asyncio.Semaphore(settings.max_concurrent_requests)
@@ -304,24 +309,27 @@ class Diagnoser:
         finally:  # 调用方断开时 response 为 None，监控记为 CLIENT_DISCONNECTED
             self.telemetry.record(request, response, trace, stream=publish is not None)
 
-    def _pipeline(self, request: ScreenDiagnoseRequest, deadline: float, on_event: Callable[[str, dict], None],
-                  cancel: threading.Event) -> PipelineOutcome:
+    def _pipeline(self, request: ScreenDiagnoseRequest, checks: list, deadline: float,
+                  on_event: Callable[[str, dict], None], cancel: threading.Event) -> PipelineOutcome:
         """在工作线程里依次运行各阶段；阶段事件经 on_event("stage", ...) 交给 SSE。各阶段共用总时限。"""
         result, started = PipelineOutcome(), time.monotonic()
         try:
-            return self._stages(request, deadline, on_event, cancel, result)
+            return self._stages(request, checks, deadline, on_event, cancel, result)
         finally:
             _log_slow_or_failed(request.request_id, result, time.monotonic() - started, cancel.is_set())
 
-    def _stages(self, request: ScreenDiagnoseRequest, deadline: float, on_event: Callable[[str, dict], None],
-                cancel: threading.Event, result: PipelineOutcome) -> PipelineOutcome:
+    def _stages(self, request: ScreenDiagnoseRequest, checks: list, deadline: float,
+                on_event: Callable[[str, dict], None], cancel: threading.Event,
+                result: PipelineOutcome) -> PipelineOutcome:
 
         def stage(name: str, data: Optional[dict] = None) -> None:
             on_event("stage", {"name": name, "data": data or {}})
 
-        def run(phase: str, prompts: tuple, tools: Optional[ToolContext], max_model_calls: Optional[int]) -> RunOutcome:
+        def run(phase: str, prompts: tuple, tools: Optional[ToolContext], max_model_calls: Optional[int],
+                late: Optional[Callable[[], tuple]] = None) -> RunOutcome:
             remaining = max(1, int(deadline - time.monotonic()))
-            outcome = self.runner(prompts[1], self.settings.dsh(remaining, prompts[0], max_model_calls),
+            prompt = LatePrompt(late) if late else prompts[1]
+            outcome = self.runner(prompt, self.settings.dsh(remaining, prompts[0], max_model_calls),
                                   on_event, cancel, tools)
             for call in outcome.calls:
                 call.phase = phase
@@ -330,31 +338,64 @@ class Diagnoser:
             result.tool_events.extend(outcome.tool_events)
             return outcome
 
-        # 0. 虚拟机画面：检查截图，再交给看图模型；失败不影响后面的诊断和回答，也不发额外的进度事件。
-        result.screen_codes = self._screen(request, deadline, cancel, result)
-        perception = result.perception
+        prechecked: list = []  # 预先检查的结果，放进评估和收尾的用户消息
 
-        def with_view(prompts: tuple) -> tuple:  # 有画面描述时加进评估和收尾的提示词
-            return with_screen(prompts, perception, request.response_language) if perception else prompts
+        def with_context(prompts: tuple) -> tuple:  # 预先检查和画面描述都加在用户消息末尾，系统消息不变
+            system, user = prompts
+            if prechecked:
+                user += "\n\n" + precheck.prechecked_block(prechecked)
+            if result.perception:
+                system, user = with_screen((system, user), result.perception, request.response_language)
+            return system, user
+
+        tools = self.settings.tools(request, max(1, int(deadline - time.monotonic())))
+        checks = checks if tools is not None else []
+        screen_attached = getattr(request, "screen", None) is not None
+
+        def prepare() -> tuple:
+            """和 DSH 启动同时进行：看图（另一个线程）和预先检查（并行调 Gateway）。返回 (用户消息, 预先检查的状态)。"""
+            viewer = threading.Thread(target=lambda: result.screen_codes.extend(
+                self._screen(request, deadline, cancel, result)), name="screen", daemon=True)
+            if screen_attached:
+                viewer.start()
+            done = precheck.PrecheckResult()
+            try:
+                done = precheck.run(checks, tools, on_event) if checks else done
+            except Exception:  # 预先检查出意外时照常诊断，由模型自己调工具
+                LOG.exception("prechecks failed for request %s", request.request_id)
+            if screen_attached:
+                viewer.join()
+            prechecked.extend(done.items)
+            result.evidence.extend(done.evidence)
+            result.tool_trace.extend(done.traces)
+            result.tool_events.extend(done.tool_events)
+            result.limitations.extend(done.limitations)
+            result.partial = result.partial or done.partial
+            return with_context(base)[1], done.prefetch
 
         # 1. 评估：可以调工具，最后只输出评估 JSON；文字不推送给学生。
+        #    预先检查和看图都在 DSH 启动的同时进行（见 prepare），失败都不影响后面的诊断和回答，也不发额外的进度事件。
         stage("reasoning_started", {"turn": 1})
-        text, limitations, partial, budget_stop = None, list(result.screen_codes), False, None
+        base = assessment_prompt(request)
+        text, budget_stop = None, None
         try:
-            assessed = run("assessment", with_view(assessment_prompt(request)),
-                           self.settings.tools(request, max(1, int(deadline - time.monotonic()))), None)
-            result.evidence, result.tool_trace = list(assessed.evidence), list(assessed.tool_trace)
-            limitations.extend(assessed.limitations)
-            partial, budget_stop = assessed.partial, assessed.budget_stop
+            assessed = run("assessment", base, tools, None, prepare if (checks or screen_attached) else None)
+            result.evidence.extend(assessed.evidence)
+            result.tool_trace.extend(assessed.tool_trace)
+            result.limitations.extend(assessed.limitations)
+            result.partial = result.partial or assessed.partial
+            budget_stop = assessed.budget_stop
             if assessed.error and budget_stop != "model_calls":
-                partial = True
-                limitations.append(assessed.error)
+                result.partial = True
+                result.limitations.append(assessed.error)
             elif not assessed.error:
                 text = assessed.answer
         except Exception:
             LOG.exception("assessment run failed for request %s", request.request_id)
-            partial = True
-            limitations.append("MODEL_PROVIDER_ERROR")
+            result.partial = True
+            result.limitations.append("MODEL_PROVIDER_ERROR")
+        limitations, partial = [*result.screen_codes, *result.limitations], result.partial
+        perception = result.perception
         tool_calls = sum(1 for event in result.tool_events if event.get("name") == "tool_started")
         stage("reasoning_finished", {"turn": 1, "outcome": "answer_ready", "tool_call_count": tool_calls})
         if cancel.is_set():
@@ -366,7 +407,7 @@ class Diagnoser:
             limitations.append("REASONING_TURN_BUDGET_EXHAUSTED")
             stage("finalization_started", {"reason": "reasoning_turn_budget_exhausted"})
             try:
-                final = run("finalization", with_view(finalization_prompt(request, result.evidence)), None, 1)
+                final = run("finalization", with_context(finalization_prompt(request, result.evidence)), None, 1)
                 if final.error:
                     limitations.append(final.error)
                 else:
@@ -394,7 +435,7 @@ class Diagnoser:
             if deadline - time.monotonic() >= ASSESSMENT_RETRY_MIN_SECONDS and not cancel.is_set():
                 stage("finalization_started", {"reason": "assessment_unstructured"})
                 try:
-                    final = run("finalization", with_view(finalization_prompt(request, result.evidence)), None, 1)
+                    final = run("finalization", with_context(finalization_prompt(request, result.evidence)), None, 1)
                     if not final.error:
                         retried_text, retried = check(final.answer)
                         if retried[0] is not None:
@@ -461,6 +502,7 @@ class Diagnoser:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.settings.total_timeout_seconds
         request = self.courses.enrich(request)
+        request, checks = precheck.resolve(request, self.scopes)  # 工具范围归 labs：Server 没给时按课程配置
         limitations = [] if request.diagnostic_scope.allowed_tools else ["LIVE_DIAGNOSTICS_NOT_RUN"]
         await emit("context_ready", {"course_id": request.course.course_id, "lesson_id": request.current_step.lesson_id})
         try:
@@ -474,7 +516,7 @@ class Diagnoser:
         events: asyncio.Queue = asyncio.Queue()
         on_event = lambda kind, data: loop.call_soon_threadsafe(events.put_nowait, (kind, data))
         # loop.time() 与 time.monotonic() 是同一个时钟；排队用掉的时间也从各阶段的预算里扣掉。
-        task = asyncio.ensure_future(asyncio.to_thread(self._pipeline, request, deadline, on_event, cancel))
+        task = asyncio.ensure_future(asyncio.to_thread(self._pipeline, request, checks, deadline, on_event, cancel))
         # 名额等工作线程真正结束才归还，避免实际并发超过上限。
         task.add_done_callback(lambda _: self.slots.release())
         trace.task = task
@@ -594,13 +636,14 @@ def _sse_event(event: str, data: dict) -> str:
 
 def create_app(*, settings: Optional[Settings] = None, runner: Optional[Runner] = None,
                course_repository: Optional[CourseRepository] = None,
-               telemetry: Optional[Telemetry] = None, screen_analyzer: Optional[ScreenAnalyzer] = None) -> FastAPI:
+               telemetry: Optional[Telemetry] = None, screen_analyzer: Optional[ScreenAnalyzer] = None,
+               scopes: Optional[precheck.ScopeConfig] = None) -> FastAPI:
     config = settings or Settings.from_env()
     courses = course_repository or CourseRepository(config.course_directory)
     selected_runner = runner or (fake_runner if config.model_provider == "fake" else run_once)
     monitor = telemetry or Telemetry.from_env(provider_name=provider_name(config.model_provider, config.model_base_url),
                                               model=config.model_name or config.model_provider)
-    diagnoser = Diagnoser(config, selected_runner, courses, monitor, screen_analyzer)
+    diagnoser = Diagnoser(config, selected_runner, courses, monitor, screen_analyzer, scopes)
     if config.vision_model and not diagnoser.screen_analyzer.enabled:
         LOG.warning("AIVIRTEACH_VISION_MODEL_NAME is set but the vision base URL is not a root or /v1 URL; "
                     "screens will not be analyzed")
