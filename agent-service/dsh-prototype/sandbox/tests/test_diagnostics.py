@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from dsh_tutor.platform_app import create_app
-from dsh_tutor.platform_assessment import is_answer_stage
+from dsh_tutor.platform_assessment import ASSESSMENT_RULES_WITHOUT_TOOLS, FINALIZATION_RULES, is_answer_stage
 from dsh_tutor.platform_runtime import RunOutcome
 from dsh_tutor.platform_assessment import drop_unknown_fields, explain_invalid
 from test_platform_api import NO_SCOPES, ASSESSMENT, EmptyCourses, answering, body, headers, settings, sse
@@ -149,6 +149,25 @@ class PromptOrderTests(unittest.TestCase):
             question = "question" if stage == "assessment" else "learner_question"
             self.assertLess(keys.index("current_step"), keys.index(question), stage)
             self.assertEqual(keys[0], "security_note", stage)
+
+
+class SafetyRuleTests(unittest.TestCase):
+    """服务器测试第 2 轮：模型曾建议把端口改成 0.0.0.0（R2-02），也曾在虚拟机关机、工具全部失败时凭旧截图说服务正常（R2-05）。"""
+
+    def test_every_stage_carries_the_rules(self):
+        calls = []
+        app = create_app(scopes=NO_SCOPES, settings=settings(), runner=answering("好", calls=calls),
+                         course_repository=EmptyCourses())
+        TestClient(app).post("/v1/agent/diagnose", json=body(), headers=headers())
+        stages = {stage: system for stage, system, *_ in calls}
+        self.assertEqual(set(stages), {"assessment", "answer"})
+        for stage, system in stages.items():
+            self.assertIn("0.0.0.0", system, stage)  # 不建议扩大访问范围
+        self.assertIn("GUEST_AGENT_UNAVAILABLE", stages["assessment"])  # 工具失败 = 没能确认，不要推断正常
+        self.assertIn("可能已经过时", stages["assessment"])  # 画面只代表截图那一刻
+        for rules in (FINALIZATION_RULES, ASSESSMENT_RULES_WITHOUT_TOOLS):
+            self.assertIn("0.0.0.0", rules)
+            self.assertIn("可能已经过时", rules)
 
 
 class StartupTests(unittest.TestCase):

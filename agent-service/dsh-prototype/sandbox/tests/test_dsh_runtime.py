@@ -209,14 +209,18 @@ class DshRuntimeTests(unittest.TestCase):
         cancel = threading.Event()
         recorder = Recorder()
 
+        cancelled_at = []
+
         def on_event(kind, data):
             recorder(kind, data)
-            if kind == "delta":
+            if kind == "delta" and not cancel.is_set():
+                cancelled_at.append(time.monotonic())
                 cancel.set()
-        started = time.monotonic()
         outcome, _, _ = self.run_script([{"slow": 10}], cancel=cancel, on_event=on_event)
         self.assertEqual(outcome.error, "CANCELLED")
-        self.assertLess(time.monotonic() - started, 6)
+        # 只计“发出取消到 run_once 返回”：DSH 的启动时间和机器忙闲无关（服务器测试里整段计时偶尔超过 6 秒）。
+        # 模型还会输出 10 秒，远早于这个时间返回才说明真的停了。
+        self.assertLess(time.monotonic() - cancelled_at[0], 4)
 
 
 class PatchTests(unittest.TestCase):

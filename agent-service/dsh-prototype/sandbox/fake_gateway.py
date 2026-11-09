@@ -94,7 +94,11 @@ SHARED: dict[str, tuple[int, str, str]] = {
     "list_course_files": (0, "compose.yaml", ""),
 }
 LABS = {"lab-001": "port_conflict", "connectivity-test-001": "port_conflict", "lab-stopped": "stopped",
-        "lab-missing": "missing", "lab-healthy": "healthy"}
+        "lab-missing": "missing", "lab-healthy": "healthy", "lab-down": "down"}
+# 虚拟机关机：和真实 Gateway 一样，虚拟机状态照常返回（State: shut off），guest agent 没有响应，
+# 要在虚拟机里执行命令的工具都返回 409（Agent 记为 GUEST_AGENT_UNAVAILABLE）。
+DOWN_VM_STATUS = ("VM status and reported IPv4 addresses were collected.", {
+    "dominfo": "Id:             -\nName:           lab-down\nState:          shut off\nCPU(s):         2\n", "ipv4_addresses": []})
 
 
 class DiagnosticRequest(BaseModel):
@@ -123,7 +127,14 @@ async def diagnostic_query(lab_id: str, tool: str, request: DiagnosticRequest) -
     if lab_id not in LABS:
         raise HTTPException(status_code=404, detail="VM not found.")
     app.state.calls.append((lab_id, tool))
-    if tool in CANNED:
+    if LABS[lab_id] == "down":
+        if tool == "get_vm_status":
+            summary, data = DOWN_VM_STATUS
+        elif tool == "get_guest_agent_status":
+            summary, data = "QEMU guest agent did not respond.", {"available": False}
+        else:
+            raise HTTPException(status_code=409, detail="QEMU guest agent is not available.")
+    elif tool in CANNED:
         summary, data = CANNED[tool]
     else:
         exit_code, stdout, stderr = SCENARIOS[LABS[lab_id]].get(tool) or SHARED.get(tool) or (0, "", "")

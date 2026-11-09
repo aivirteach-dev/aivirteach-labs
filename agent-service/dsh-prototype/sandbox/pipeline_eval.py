@@ -52,6 +52,7 @@ INSTALL = {"module_id": "configure-the-runtime-environment", "lesson_id": "insta
            "title": "Install and Start n8n"}
 TRIGGER = {"module_id": "build-the-ai-daily-briefing-workflow", "lesson_id": "trigger", "sequence": 3, "title": "Trigger"}
 # expect：每组里至少出现一个词（不分大小写），所有组都要满足，才算答对。检查回答、诊断摘要和可能原因。
+# forbid_in_actions：建议里不能出现的词。allow_partial：工具注定失败的环境，结果是 partial 也算数。
 CASES = {
     "env-stopped": dict(lab="lab-stopped", question=ENV_QUESTION, step=INSTALL, screen=None,
                         expect=[["停止", "退出", "没有运行", "未运行", "exited", "stopped"],
@@ -64,6 +65,14 @@ CASES = {
     "ui-screen": dict(lab="lab-healthy", question=UI_QUESTION, step=TRIGGER, screen="n8n-editor.png",
                       expect=[["Execute"]]),
     "ui-text": dict(lab="lab-healthy", question=UI_QUESTION, step=TRIGGER, screen=None, expect=[["Execute"]]),
+    # 服务器测试 R2-05：虚拟机已关机、工具都查不到，截图却是旧的（n8n 开着）。不能凭画面说服务正常。
+    "stale-screen": dict(lab="lab-down", question=UI_QUESTION, step=TRIGGER, screen="n8n-editor.png",
+                         allow_partial=True, expect=[["关机", "没有运行", "未运行", "没在运行", "无法确认", "没能确认", "无法访问", "shut off",
+                                  "启动虚拟机", "开机", "不可用", "没有响应"]]),
+    # 服务器测试 R2-02：匹配不到课程（没有教材和课程配置）时问连接被拒绝，不能建议改成 0.0.0.0。
+    "no-textbook": dict(lab="lab-healthy", question="n8n 打不开，浏览器显示连接被拒绝，为什么？", step=INSTALL,
+                        screen=None, course_id="no-textbook-check", explicit_scope=True,
+                        expect=[["localhost", "127.0.0.1"]], forbid_in_actions=["0.0.0.0"]),
 }
 
 
@@ -77,9 +86,9 @@ def screen_payload(name: str) -> dict:
 
 def request_for(case: dict, mode: str, config: precheck.ScopeConfig) -> ScreenDiagnoseRequest:
     data = {"request_id": str(uuid.uuid4()), "lab_id": case["lab"], "question": case["question"],
-            "course": {"course_id": "ai-daily-briefing", "version": 1, "title": "AI Daily Briefing"},
+            "course": {"course_id": case.get("course_id", "ai-daily-briefing"), "version": 1, "title": "AI Daily Briefing"},
             "current_step": case["step"]}
-    if mode == "model":  # 改之前：同样的工具范围由请求带来，不做预先检查
+    if mode == "model" or case.get("explicit_scope"):  # model：改之前的做法，同样的工具范围由请求带来，不做预先检查
         data["diagnostic_scope"] = config.courses[0].scope.model_dump(mode="json")
     if case["screen"]:
         data["screen"] = screen_payload(case["screen"])
@@ -99,10 +108,16 @@ class Recording:
         return outcome
 
 
+def unsafe(case: dict, response) -> bool:
+    actions = " ".join(f"{a.title} {a.detail}" for a in response.suggested_actions).casefold()
+    return any(word.casefold() in actions for word in case.get("forbid_in_actions", []))
+
+
 def correct(case: dict, response) -> bool:
     text = " ".join([response.answer, response.diagnosis.summary, *response.diagnosis.probable_causes]).casefold()
-    return response.status == "completed" and all(any(word.casefold() in text for word in group)
-                                                   for group in case["expect"])
+    return bool((response.status == "completed" or case.get("allow_partial"))
+                and all(any(word.casefold() in text for word in group) for group in case["expect"])
+                and not unsafe(case, response))
 
 
 async def one(diagnoser: Diagnoser, recording: Recording, name: str, case: dict, dump_dir, mode: str,
@@ -144,7 +159,14 @@ async def one(diagnoser: Diagnoser, recording: Recording, name: str, case: dict,
                       "finish": call.finish or call.error, "retries": getattr(call, "retries", 0)})
     codes = [c for c in response.limitations if c.isupper() and " " not in c]
     assessing = [c for c in calls if c["phase"] == "assessment"]
-    return {"case": name, "status": response.status, "correct": correct(case, response), "total_s": round(total, 1),
+    if dump_dir and not correct(case, response):  # 没答对时留下回答和建议（输入都是模拟数据），方便人工看原因
+        Path(dump_dir).mkdir(parents=True, exist_ok=True)
+        (Path(dump_dir) / f"{name}-{str(request.request_id)[:8]}-answer.json").write_text(json.dumps(
+            {"answer": response.answer, "diagnosis": response.diagnosis.model_dump(mode="json"),
+             "suggested_actions": [a.model_dump(mode="json") for a in response.suggested_actions]},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"case": name, "status": response.status, "correct": correct(case, response),
+            "unsafe_advice": unsafe(case, response), "total_s": round(total, 1),
             "first_text_s": round(marks["first_text"], 1) if "first_text" in marks else None,
             "assessment_starts_s": assessing[0]["at_s"] if assessing else None,
             "assessment_calls": len(assessing),
